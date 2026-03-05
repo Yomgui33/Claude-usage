@@ -1,18 +1,12 @@
 """
 Application coordinator.
 
-Responsibilities:
-- Own the tkinter root window (hidden – only the tray icon is visible)
-- Manage the refresh timer
-- Coordinate between TrayIcon, MainWindow, and SettingsWindow
-- Bridge thread-safe calls from the tray into the tkinter main thread
-
-Data source priority
---------------------
-1. Anthropic API  – if ``anthropic_api_key`` is set in config, fetch real-time
-   rate-limit headers (same numbers Claude Desktop shows).
-2. JSONL files    – parse local Claude Code conversation history.
-3. Auto           – try API first, fall back to JSONL.
+Data source priority (configurable in Settings)
+-----------------------------------------------
+auto     – try Desktop session → Anthropic API → JSONL files
+desktop  – read Claude Desktop session cookies, call claude.ai internal API
+api      – Anthropic API rate-limit headers (requires API key)
+jsonl    – parse local Claude Code CLI conversation files
 """
 from __future__ import annotations
 
@@ -30,6 +24,7 @@ from .usage_reader import (
     diagnose,
 )
 from .api_client import fetch_usage as api_fetch_usage
+from .desktop_session import fetch_usage as desktop_fetch_usage, is_available as desktop_is_available
 from .startup import is_enabled as startup_is_enabled, set_enabled as startup_set
 from .tray import TrayIcon
 from .ui.main_window import MainWindow
@@ -121,43 +116,64 @@ class App:
         self._schedule_next_refresh()
 
     def _do_refresh(self) -> None:
-        source    = self._cfg.get("data_source", "auto")
-        api_key   = self._cfg.get("anthropic_api_key", "").strip()
+        source     = self._cfg.get("data_source", "auto")
+        api_key    = self._cfg.get("anthropic_api_key", "").strip()
         claude_dir = self._cfg.get("claude_data_dir", "")
-        limit_5h  = self._cfg.get("limit_5h", 500_000)
-        limit_7d  = self._cfg.get("limit_7d", 5_000_000)
-        now       = datetime.now(timezone.utc)
+        limit_5h   = self._cfg.get("limit_5h", 500_000)
+        limit_7d   = self._cfg.get("limit_7d", 5_000_000)
+        now        = datetime.now(timezone.utc)
 
         pct_5h = pct_7d = 0.0
         reset_5h = reset_7d = None
         tokens_5h = tokens_7d = 0
 
+        use_desktop = (source == "desktop") or (
+            source == "auto" and desktop_is_available() and not api_key
+        )
         use_api = (source == "api") or (source == "auto" and bool(api_key))
 
-        # ── 1. Try Anthropic API ──────────────────────────────────────
+        # ── 1. Claude Desktop session ─────────────────────────────────
+        if use_desktop:
+            desk = desktop_fetch_usage()
+            if desk["error"]:
+                if source == "desktop":
+                    self._main_win.set_status(f"Desktop session: {desk['error']}")
+                    self._last_refresh = now
+                    self._tray.update_icon(0, 0)
+                    return
+                # auto mode → fall through
+            else:
+                pct_5h   = desk["pct_5h"]   or 0.0
+                pct_7d   = desk["pct_7d"]   or 0.0
+                reset_5h = desk["reset_5h"]
+                reset_7d = desk["reset_7d"]
+                # We don't have raw token counts from the desktop session
+                tokens_5h = int(pct_5h / 100 * limit_5h)
+                tokens_7d = int(pct_7d / 100 * limit_7d)
+                self._main_win.set_status(None)
+                self._persist_and_update(now, tokens_5h, tokens_7d, limit_5h, limit_7d,
+                                         pct_5h, pct_7d, reset_5h, reset_7d)
+                return
+
+        # ── 2. Anthropic API (developer API key) ──────────────────────
         if use_api and api_key:
             api_data = api_fetch_usage(api_key)
             if api_data["error"]:
                 self._last_api_error = api_data["error"]
-                # If API fails and we're in "api" mode, show error; else fall through
                 if source == "api":
                     self._main_win.set_status(f"API error: {api_data['error']}")
                     self._last_refresh = now
                     self._tray.update_icon(0, 0)
                     return
-                # "auto" mode – fall through to JSONL
+                # auto mode → fall through to JSONL
             else:
                 self._last_api_error = None
-
-                # Prefer API data; fill in limits from config as fallback
                 if api_data["pct_5h"] is not None:
                     pct_5h    = api_data["pct_5h"]
                     reset_5h  = api_data["reset_5h"]
                     tokens_5h = api_data["used_5h"] or 0
-                    # Update limit from API response if available
                     if api_data["limit_5h"]:
                         limit_5h = api_data["limit_5h"]
-
                 if api_data["pct_7d"] is not None:
                     pct_7d    = api_data["pct_7d"]
                     reset_7d  = api_data["reset_7d"]
@@ -165,18 +181,16 @@ class App:
                     if api_data["limit_7d"]:
                         limit_7d = api_data["limit_7d"]
                 else:
-                    # 7d window not in API headers → fall back to JSONL for 7d
                     jsonl = compute_usage(claude_dir)
                     tokens_7d = jsonl["tokens_7d"]
-                    pct_7d    = min(100.0, tokens_7d / limit_7d * 100) if limit_7d else 0.0
-                    reset_7d  = compute_reset_time(jsonl["oldest_event_7d"], timedelta(days=7))
-
+                    pct_7d = min(100.0, tokens_7d / limit_7d * 100) if limit_7d else 0.0
+                    reset_7d = compute_reset_time(jsonl["oldest_event_7d"], timedelta(days=7))
                 self._main_win.set_status(None)
                 self._persist_and_update(now, tokens_5h, tokens_7d, limit_5h, limit_7d,
                                          pct_5h, pct_7d, reset_5h, reset_7d)
                 return
 
-        # ── 2. JSONL file parsing ─────────────────────────────────────
+        # ── 3. JSONL file parsing ─────────────────────────────────────
         usage = compute_usage(claude_dir)
         tokens_5h = usage["tokens_5h"]
         tokens_7d = usage["tokens_7d"]

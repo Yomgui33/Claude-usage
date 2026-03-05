@@ -83,9 +83,10 @@ class SettingsWindow:
         src_frame.pack(fill="x", padx=pad, pady=(0, 8))
         self._var_source = tk.StringVar(value=self._cfg.get("data_source", "auto"))
         for label, val in [
-            ("Auto (API if key set, else JSONL files)", "auto"),
-            ("Anthropic API only", "api"),
-            ("Local JSONL files only", "jsonl"),
+            ("Auto (Desktop session → API key → JSONL files)", "auto"),
+            ("Claude Desktop session  ← recommended for subscribers", "desktop"),
+            ("Anthropic API key only  ← for API users", "api"),
+            ("Local JSONL files only  ← for Claude Code CLI users", "jsonl"),
         ]:
             tk.Radiobutton(
                 src_frame, text=label, variable=self._var_source, value=val,
@@ -111,12 +112,19 @@ class SettingsWindow:
             relief="flat", bg="#dddddd",
         ).pack(side="left", padx=(4, 0))
 
-        # Diagnostics button
+        # Diagnostics buttons
+        diag_row = tk.Frame(win, bg=BG)
+        diag_row.pack(fill="x", padx=pad, pady=(0, 8))
         tk.Button(
-            win, text="Run diagnostics on this directory",
+            diag_row, text="Diagnose JSONL directory",
             relief="flat", bg="#dddddd", fg=TEXT,
             command=self._run_diagnostics,
-        ).pack(anchor="w", padx=pad, pady=(0, 8))
+        ).pack(side="left", padx=(0, 4))
+        tk.Button(
+            diag_row, text="Diagnose Desktop session",
+            relief="flat", bg="#dddddd", fg=TEXT,
+            command=self._run_desktop_diagnostics,
+        ).pack(side="left")
 
         # ── Token limits ──────────────────────────────────────────────
         self._add_section(
@@ -234,8 +242,17 @@ class SettingsWindow:
         from ..usage_reader import diagnose
         result = diagnose(self._var_dir.get())
         messagebox.showinfo(
-            "Diagnostics",
+            "JSONL Diagnostics",
             result["message"],
+            parent=self._win,
+        )
+
+    def _run_desktop_diagnostics(self) -> None:
+        from ..desktop_session import diagnose as desktop_diagnose
+        msg = desktop_diagnose()
+        messagebox.showinfo(
+            "Claude Desktop Session Diagnostics",
+            msg,
             parent=self._win,
         )
 

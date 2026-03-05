@@ -78,7 +78,11 @@ DEFAULTS = {
     "refresh_interval": 300,
     # Launch at Windows startup
     "launch_at_startup": False,
-    # Data source: "api" | "jsonl" | "auto"
+    # Data source: "auto" | "desktop" | "api" | "jsonl"
+    # auto    → Desktop session first, then API key, then JSONL
+    # desktop → Claude Desktop session cookies (subscribers without API key)
+    # api     → Anthropic developer API key (rate-limit headers)
+    # jsonl   → Local Claude Code CLI conversation files
     "data_source": "auto",
 }
 
