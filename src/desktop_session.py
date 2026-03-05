@@ -792,13 +792,26 @@ def fetch_usage() -> dict:
         # confuse it with claude.ai-specific fields (Referer, Origin).
         if oauth and url.startswith("https://api.anthropic.com"):
             access = _extract_token_value(oauth)  # type: ignore[arg-type]
-            # Claude Desktop uses OAuth Bearer auth with api.anthropic.com,
-            # NOT the x-api-key header (that's for static API keys only).
+            # Extract workspace UUID from the namespaced key
+            # "{user-uuid}:{workspace-uuid}:https://api.anthropic.com"
+            workspace_id = ""
+            for token_key in oauth:  # type: ignore[union-attr]
+                parts = str(token_key).split(":")
+                if len(parts) >= 2 and len(parts[1]) == 36:
+                    workspace_id = parts[1]
+                    break
+            # Try all auth styles Claude Desktop may use:
+            # - x-api-key (static API keys, sk-ant-api03-...)
+            # - Authorization: Bearer (OAuth tokens, sk-ant-ocp04-...)
+            # anthropic-account-id scopes the token to the right workspace.
             req_headers = {
+                "x-api-key": access,
                 "Authorization": f"Bearer {access}",
                 "anthropic-version": "2023-06-01",
                 "Accept": "application/json",
             }
+            if workspace_id:
+                req_headers["anthropic-account-id"] = workspace_id
         else:
             req_headers = headers
 
@@ -816,7 +829,11 @@ def fetch_usage() -> dict:
                 )
 
             if resp.status_code in (401, 403):
-                raw_responses[url] = f"HTTP {resp.status_code}"
+                # Capture response body — Anthropic returns JSON with error details.
+                try:
+                    raw_responses[url] = f"HTTP {resp.status_code}: {resp.json()}"
+                except ValueError:
+                    raw_responses[url] = f"HTTP {resp.status_code}: {resp.text[:200]}"
                 if oauth:
                     # Different endpoints need different auth; keep trying.
                     continue
