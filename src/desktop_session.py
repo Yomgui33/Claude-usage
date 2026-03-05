@@ -626,9 +626,14 @@ def _dir_tree(root: Path, max_depth: int = 3, _depth: int = 0) -> list[str]:
     except (PermissionError, OSError):
         return [f"{indent}  (permission denied)"]
     for entry in entries[:30]:
-        suffix = "\\" if entry.is_dir() else ""
+        try:
+            is_dir = entry.is_dir()
+        except OSError:
+            lines.append(f"{indent}  {entry.name}  (inaccessible)")
+            continue
+        suffix = "\\" if is_dir else ""
         lines.append(f"{indent}  {entry.name}{suffix}")
-        if entry.is_dir() and _depth < max_depth - 1:
+        if is_dir and _depth < max_depth - 1:
             lines.extend(_dir_tree(entry, max_depth, _depth + 1))
     if len(entries) > 30:
         lines.append(f"{indent}  … ({len(entries) - 30} more)")
