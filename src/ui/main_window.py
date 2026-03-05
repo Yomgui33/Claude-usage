@@ -262,6 +262,14 @@ class MainWindow:
         self._bar_7d.pack(fill="x", padx=pad, pady=(2, 0))
         self._lbl_7d_reset = self._reset_label(win)
 
+        # Status / hint message (hidden by default)
+        self._lbl_status = tk.Label(
+            win, text="",
+            font=("Segoe UI", 9), bg=BG, fg="#b07800",
+            anchor="w", wraplength=self.WIDTH - 40, justify="left",
+        )
+        # Not packed yet – set_status() shows/hides it
+
         sep2 = tk.Frame(win, bg="#c8d4a8", height=1)
         sep2.pack(fill="x", padx=pad, pady=(12, 8))
 
@@ -457,6 +465,18 @@ class MainWindow:
 
     def set_startup_state(self, enabled: bool) -> None:
         self._startup_var.set(enabled)
+
+    def set_status(self, message: str | None) -> None:
+        """
+        Display a status / hint message below the progress bars.
+        Pass None to clear.
+        """
+        if message:
+            self._lbl_status.configure(text=message)
+            self._lbl_status.pack(fill="x", padx=16, pady=(4, 0))
+        else:
+            self._lbl_status.configure(text="")
+            self._lbl_status.pack_forget()
 
     def _toggle_startup(self) -> None:
         self._on_startup_toggle(self._startup_var.get())

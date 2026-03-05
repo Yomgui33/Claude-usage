@@ -27,16 +27,50 @@ from pathlib import Path
 from typing import Iterator
 
 
+def scan_dirs(claude_dir: str) -> dict:
+    """
+    Return a diagnostic summary of what was found in the data directory.
+
+    Useful for the Settings window to help users understand why usage
+    might show as 0%.
+    """
+    root = Path(claude_dir)
+    result = {
+        "dir_exists": root.exists(),
+        "jsonl_count": 0,
+        "total_size_kb": 0,
+        "paths_tried": [str(root)],
+    }
+    if root.exists():
+        files = list(root.rglob("*.jsonl"))
+        result["jsonl_count"] = len(files)
+        result["total_size_kb"] = sum(f.stat().st_size for f in files) // 1024
+    return result
+
+
 def _iter_jsonl_files(claude_dir: str) -> Iterator[Path]:
-    """Yield every .jsonl file found under the claude data directory."""
+    """
+    Yield every .jsonl file found under the claude data directory.
+
+    Searches both Claude Code CLI layout (~/.claude/projects/) and
+    Claude Desktop layout (AppData/Claude/conversations/ etc.).
+    """
     root = Path(claude_dir)
     if not root.exists():
         return
-    # Projects are stored under <root>/projects/**/*.jsonl
+
+    # Claude Code CLI: ~/.claude/projects/<hash>/*.jsonl
     projects_dir = root / "projects"
     if projects_dir.exists():
         yield from projects_dir.rglob("*.jsonl")
-    # Some older versions store sessions directly under root
+
+    # Claude Desktop may store JSONL under conversations/ or logs/
+    for subdir in ("conversations", "logs", "history"):
+        d = root / subdir
+        if d.exists():
+            yield from d.rglob("*.jsonl")
+
+    # Flat JSONL files directly under root (older versions)
     yield from root.glob("*.jsonl")
 
 
@@ -164,6 +198,59 @@ def compute_reset_time(oldest_event: datetime | None, window: timedelta) -> time
     expires_at = oldest_event + window
     remaining = expires_at - now
     return remaining if remaining.total_seconds() > 0 else timedelta(0)
+
+
+def diagnose(claude_dir: str) -> dict:
+    """
+    Return human-readable diagnostic information about the data source.
+
+    Used by the Settings window to explain why usage might show as 0%.
+    """
+    root = Path(claude_dir)
+    lines = []
+
+    if not root.exists():
+        lines.append(f"Directory not found: {claude_dir}")
+        lines.append("→ Possible causes:")
+        lines.append("  • Claude Code CLI is not installed")
+        lines.append("  • You only use Claude Desktop (different storage format)")
+        lines.append("  • The path is incorrect – update it in Settings")
+        return {"ok": False, "message": "\n".join(lines), "jsonl_count": 0}
+
+    all_jsonl = list(root.rglob("*.jsonl"))
+    if not all_jsonl:
+        lines.append(f"Directory exists but contains no .jsonl files: {claude_dir}")
+        lines.append("→ Possible causes:")
+        lines.append("  • You use Claude Desktop, not Claude Code CLI")
+        lines.append("    → Add your Anthropic API key in Settings for accurate data")
+        lines.append("  • You haven't started any Claude Code sessions yet")
+        return {"ok": False, "message": "\n".join(lines), "jsonl_count": 0}
+
+    size_kb = sum(f.stat().st_size for f in all_jsonl) // 1024
+    lines.append(f"Found {len(all_jsonl)} JSONL file(s) ({size_kb} KB) in {claude_dir}")
+
+    # Quick sanity-check: try to find at least one usage entry
+    sample_tokens = 0
+    for path in all_jsonl[:5]:
+        try:
+            with open(path, encoding="utf-8", errors="ignore") as fh:
+                for line in fh:
+                    try:
+                        entry = json.loads(line.strip())
+                        sample_tokens += _tokens_from_entry(entry)
+                    except json.JSONDecodeError:
+                        pass
+        except OSError:
+            pass
+
+    if sample_tokens == 0:
+        lines.append("⚠ Files found but no token usage detected in the first 5 files.")
+        lines.append("  The files may use an unsupported format.")
+        lines.append("  → Add your Anthropic API key in Settings for accurate data.")
+        return {"ok": False, "message": "\n".join(lines), "jsonl_count": len(all_jsonl)}
+
+    lines.append(f"✓ Token usage data found. Data source is working correctly.")
+    return {"ok": True, "message": "\n".join(lines), "jsonl_count": len(all_jsonl)}
 
 
 def build_history(claude_dir: str, bucket_minutes: int = 60) -> list[dict]:

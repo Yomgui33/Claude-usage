@@ -10,13 +10,14 @@ from typing import Callable
 BG       = "#f5f5f5"
 TEXT     = "#222222"
 ENTRY_BG = "#ffffff"
+HINT     = "#888888"
 
 
 class SettingsWindow:
     def __init__(self, parent: tk.Tk, cfg: dict, on_save: Callable[[dict], None]):
-        self._parent   = parent
-        self._cfg      = dict(cfg)
-        self._on_save  = on_save
+        self._parent  = parent
+        self._cfg     = dict(cfg)
+        self._on_save = on_save
         self._win: tk.Toplevel | None = None
 
     # ------------------------------------------------------------------
@@ -37,34 +38,102 @@ class SettingsWindow:
 
         pad = 12
 
+        # ── Anthropic API Key ─────────────────────────────────────────
+        self._add_section(
+            win,
+            "Anthropic API Key  (recommended)",
+            tip="Provides the same usage numbers shown in Claude Desktop.\n"
+                "Get your key at console.anthropic.com → API Keys.",
+        )
+
+        key_frame = tk.Frame(win, bg=BG)
+        key_frame.pack(fill="x", padx=pad, pady=(0, 2))
+
+        self._var_key = tk.StringVar(value=self._cfg.get("anthropic_api_key", ""))
+        self._entry_key = tk.Entry(
+            key_frame,
+            textvariable=self._var_key,
+            width=42,
+            bg=ENTRY_BG,
+            show="•",   # mask key
+        )
+        self._entry_key.pack(side="left", fill="x", expand=True)
+
+        tk.Button(
+            key_frame, text="Show",
+            relief="flat", bg="#dddddd",
+            command=self._toggle_key_visibility,
+        ).pack(side="left", padx=(4, 0))
+
+        tk.Button(
+            key_frame, text="Test",
+            relief="flat", bg="#dddddd",
+            command=self._test_api_key,
+        ).pack(side="left", padx=(4, 0))
+
+        self._lbl_key_status = tk.Label(
+            win, text="", font=("Segoe UI", 9), bg=BG, fg=HINT, anchor="w",
+        )
+        self._lbl_key_status.pack(fill="x", padx=pad, pady=(0, 4))
+
+        # ── Data source ───────────────────────────────────────────────
+        self._add_section(win, "Data Source")
+
+        src_frame = tk.Frame(win, bg=BG)
+        src_frame.pack(fill="x", padx=pad, pady=(0, 8))
+        self._var_source = tk.StringVar(value=self._cfg.get("data_source", "auto"))
+        for label, val in [
+            ("Auto (API if key set, else JSONL files)", "auto"),
+            ("Anthropic API only", "api"),
+            ("Local JSONL files only", "jsonl"),
+        ]:
+            tk.Radiobutton(
+                src_frame, text=label, variable=self._var_source, value=val,
+                bg=BG, fg=TEXT, activebackground=BG,
+            ).pack(anchor="w")
+
         # ── Claude data directory ─────────────────────────────────────
-        self._add_section(win, "Claude Code Data Directory")
+        self._add_section(
+            win,
+            "Claude Code Data Directory",
+            tip="Used for JSONL-based reading. Typically ~/.claude on all platforms.",
+        )
 
         dir_frame = tk.Frame(win, bg=BG)
-        dir_frame.pack(fill="x", padx=pad, pady=(0, 8))
+        dir_frame.pack(fill="x", padx=pad, pady=(0, 4))
 
         self._var_dir = tk.StringVar(value=self._cfg.get("claude_data_dir", ""))
-        e = tk.Entry(dir_frame, textvariable=self._var_dir, width=40, bg=ENTRY_BG)
-        e.pack(side="left", fill="x", expand=True)
-
+        tk.Entry(dir_frame, textvariable=self._var_dir, width=38, bg=ENTRY_BG).pack(
+            side="left", fill="x", expand=True)
         tk.Button(
             dir_frame, text="Browse…",
             command=self._browse_dir,
             relief="flat", bg="#dddddd",
         ).pack(side="left", padx=(4, 0))
 
+        # Diagnostics button
+        tk.Button(
+            win, text="Run diagnostics on this directory",
+            relief="flat", bg="#dddddd", fg=TEXT,
+            command=self._run_diagnostics,
+        ).pack(anchor="w", padx=pad, pady=(0, 8))
+
         # ── Token limits ──────────────────────────────────────────────
-        self._add_section(win, "Token Limits (adjust to match your Claude plan)")
+        self._add_section(
+            win,
+            "Token Limits (for JSONL mode only)",
+            tip="When using the API key the limits are read from headers automatically.",
+        )
 
         limits_frame = tk.Frame(win, bg=BG)
-        limits_frame.pack(fill="x", padx=pad, pady=(0, 8))
+        limits_frame.pack(fill="x", padx=pad, pady=(0, 4))
 
         tk.Label(limits_frame, text="5-Hour window:", bg=BG, fg=TEXT).grid(
             row=0, column=0, sticky="w", pady=3)
         self._var_5h = tk.StringVar(value=str(self._cfg.get("limit_5h", 500_000)))
         tk.Entry(limits_frame, textvariable=self._var_5h, width=12, bg=ENTRY_BG).grid(
             row=0, column=1, padx=(8, 0), sticky="w")
-        tk.Label(limits_frame, text="tokens", bg=BG, fg="#888888").grid(
+        tk.Label(limits_frame, text="tokens", bg=BG, fg=HINT).grid(
             row=0, column=2, padx=(4, 0), sticky="w")
 
         tk.Label(limits_frame, text="7-Day window:", bg=BG, fg=TEXT).grid(
@@ -72,7 +141,7 @@ class SettingsWindow:
         self._var_7d = tk.StringVar(value=str(self._cfg.get("limit_7d", 5_000_000)))
         tk.Entry(limits_frame, textvariable=self._var_7d, width=12, bg=ENTRY_BG).grid(
             row=1, column=1, padx=(8, 0), sticky="w")
-        tk.Label(limits_frame, text="tokens", bg=BG, fg="#888888").grid(
+        tk.Label(limits_frame, text="tokens", bg=BG, fg=HINT).grid(
             row=1, column=2, padx=(4, 0), sticky="w")
 
         # Preset buttons
@@ -85,10 +154,7 @@ class SettingsWindow:
             ("Max 20×",  2_000_000, 20_000_000),
         ]:
             tk.Button(
-                preset_frame,
-                text=label,
-                relief="flat",
-                bg="#dddddd",
+                preset_frame, text=label, relief="flat", bg="#dddddd",
                 command=lambda a=l5, b=l7: self._apply_preset(a, b),
             ).pack(side="left", padx=4)
 
@@ -97,7 +163,6 @@ class SettingsWindow:
 
         ref_frame = tk.Frame(win, bg=BG)
         ref_frame.pack(fill="x", padx=pad, pady=(0, 8))
-
         self._var_interval = tk.StringVar(
             value=str(self._cfg.get("refresh_interval", 300)))
         tk.Entry(ref_frame, textvariable=self._var_interval, width=8, bg=ENTRY_BG).pack(
@@ -106,8 +171,7 @@ class SettingsWindow:
 
         # ── Save / Cancel ─────────────────────────────────────────────
         btn_frame = tk.Frame(win, bg=BG)
-        btn_frame.pack(fill="x", padx=pad, pady=(8, pad))
-
+        btn_frame.pack(fill="x", padx=pad, pady=(4, pad))
         tk.Button(
             btn_frame, text="Save",
             bg="#4a86c8", fg="white", relief="flat",
@@ -121,12 +185,18 @@ class SettingsWindow:
 
     # ------------------------------------------------------------------
 
-    def _add_section(self, parent: tk.Widget, text: str) -> None:
-        lbl = tk.Label(parent, text=text, font=("Segoe UI", 10, "bold"),
-                       bg=BG, fg=TEXT, anchor="w")
-        lbl.pack(fill="x", padx=12, pady=(10, 2))
-        sep = tk.Frame(parent, bg="#cccccc", height=1)
-        sep.pack(fill="x", padx=12, pady=(0, 4))
+    def _add_section(self, parent: tk.Widget, text: str, tip: str = "") -> None:
+        tk.Label(
+            parent, text=text, font=("Segoe UI", 10, "bold"),
+            bg=BG, fg=TEXT, anchor="w",
+        ).pack(fill="x", padx=12, pady=(10, 0))
+        if tip:
+            tk.Label(
+                parent, text=tip,
+                font=("Segoe UI", 8), bg=BG, fg=HINT,
+                anchor="w", justify="left",
+            ).pack(fill="x", padx=12, pady=(0, 2))
+        tk.Frame(parent, bg="#cccccc", height=1).pack(fill="x", padx=12, pady=(2, 4))
 
     def _browse_dir(self) -> None:
         d = filedialog.askdirectory(
@@ -140,6 +210,34 @@ class SettingsWindow:
     def _apply_preset(self, l5: int, l7: int) -> None:
         self._var_5h.set(str(l5))
         self._var_7d.set(str(l7))
+
+    def _toggle_key_visibility(self) -> None:
+        current = self._entry_key.cget("show")
+        self._entry_key.configure(show="" if current == "•" else "•")
+
+    def _test_api_key(self) -> None:
+        from ..api_client import test_key
+        key = self._var_key.get().strip()
+        if not key:
+            self._lbl_key_status.configure(
+                text="Enter an API key first.", fg="#cc8800")
+            return
+        self._lbl_key_status.configure(text="Testing…", fg=HINT)
+        self._win.update()
+        ok, msg = test_key(key)
+        self._lbl_key_status.configure(
+            text=f"{'✓' if ok else '✗'}  {msg}",
+            fg="#2e7d32" if ok else "#c62828",
+        )
+
+    def _run_diagnostics(self) -> None:
+        from ..usage_reader import diagnose
+        result = diagnose(self._var_dir.get())
+        messagebox.showinfo(
+            "Diagnostics",
+            result["message"],
+            parent=self._win,
+        )
 
     def _save(self) -> None:
         try:
@@ -156,6 +254,8 @@ class SettingsWindow:
 
         new_cfg = {
             **self._cfg,
+            "anthropic_api_key": self._var_key.get().strip(),
+            "data_source": self._var_source.get(),
             "claude_data_dir": self._var_dir.get().strip(),
             "limit_5h": limit_5h,
             "limit_7d": limit_7d,
