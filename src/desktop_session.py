@@ -781,6 +781,95 @@ def _inspect_claude_desktop_dir(d: Path) -> list[str]:
     return lines
 
 
+def _diagnose_alt_auth(userdata_dirs: list[Path]) -> list[str]:
+    """
+    When no Chromium cookies are found, probe alternative auth storage:
+    1. Windows Credential Manager (electron-keytar)
+    2. Network\Cookies existence + size
+    3. Local Storage\leveldb file list
+    4. Full config.json (all keys)
+    """
+    lines: list[str] = []
+
+    # ── A. Windows Credential Manager ────────────────────────────────────────
+    lines.append("\n=== A. Windows Credential Manager ===")
+    try:
+        import win32cred  # type: ignore
+        all_creds = win32cred.CredEnumerate(None, 0) or []
+        found = [
+            c for c in all_creds
+            if any(
+                kw in (c.get("TargetName") or "").lower()
+                for kw in ("claude", "anthropic", "ant-", "anthr")
+            )
+        ]
+        if found:
+            for c in found:
+                lines.append(f"  Target: {c.get('TargetName')}")
+                lines.append(f"  User:   {c.get('UserName')}")
+                blob = c.get("CredentialBlob")
+                if blob:
+                    try:
+                        decoded = blob.decode("utf-16-le")
+                        lines.append(f"  Blob (utf-16): {decoded[:120]}")
+                    except Exception:
+                        lines.append(f"  Blob (hex):    {blob[:60].hex()}")
+        else:
+            lines.append(f"  Searched {len(all_creds)} credentials — none match claude/anthropic")
+    except ImportError:
+        lines.append("  win32cred not available")
+    except Exception as exc:
+        lines.append(f"  Error: {exc}")
+
+    # ── B. Direct Network\Cookies probe ──────────────────────────────────────
+    lines.append("\n=== B. Network\\Cookies probe ===")
+    for d in userdata_dirs:
+        nc = d / "Network" / "Cookies"
+        lines.append(f"  {nc}")
+        if nc.exists():
+            size = nc.stat().st_size
+            sqlite_ok = _is_sqlite(nc)
+            lines.append(f"    exists: yes  size: {size}  sqlite: {sqlite_ok}")
+        else:
+            lines.append("    exists: NO")
+        # Also legacy path
+        lc = d / "Cookies"
+        if lc.exists():
+            lines.append(f"  {lc}  (legacy)  size: {lc.stat().st_size}")
+
+    # ── C. Local Storage\leveldb file list ───────────────────────────────────
+    lines.append("\n=== C. Local Storage\\leveldb ===")
+    for d in userdata_dirs:
+        ldb_dir = d / "Local Storage" / "leveldb"
+        if not ldb_dir.exists():
+            lines.append(f"  {ldb_dir}  → does not exist")
+            continue
+        lines.append(f"  {ldb_dir}")
+        try:
+            for f in sorted(ldb_dir.iterdir())[:20]:
+                lines.append(f"    {f.name}  ({f.stat().st_size} bytes)")
+        except OSError as exc:
+            lines.append(f"    (error: {exc})")
+
+    # ── D. Full config.json key listing ──────────────────────────────────────
+    lines.append("\n=== D. config.json ALL keys ===")
+    for d in userdata_dirs:
+        cfg = d / "config.json"
+        if not cfg.exists():
+            continue
+        try:
+            data = json.loads(cfg.read_bytes())
+            for k, v in data.items():
+                v_str = str(v)
+                if len(v_str) > 80:
+                    v_str = v_str[:80] + "…"
+                lines.append(f"  {k}: {v_str}")
+        except Exception as exc:
+            lines.append(f"  (error reading config.json: {exc})")
+
+    return lines
+
+
 def diagnose() -> str:
     """Return a human-readable diagnostic string for the Settings window."""
     lines: list[str] = []
@@ -866,8 +955,9 @@ def diagnose() -> str:
     if total_cookies == 0:
         lines.append(
             "\n→ No claude.ai cookies found.\n"
-            "  See the deep inspection above for alternative auth paths."
+            "  Checking alternative auth storage…"
         )
+        lines.extend(_diagnose_alt_auth(userdata_dirs))
         return "\n".join(lines)
 
     # ── 5. API call ───────────────────────────────────────────────────────────
