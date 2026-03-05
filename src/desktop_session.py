@@ -602,6 +602,61 @@ def _extract_usage_from_headers(headers: dict) -> Optional[dict]:
     return None
 
 
+def _scan_leveldb_for_strings(ldb_dir: Path, keywords: list[str]) -> list[str]:
+    """
+    Raw binary scan of Chromium Local Storage LevelDB files.
+
+    LevelDB .ldb (SSTable) and .log files contain human-readable strings
+    intermixed with binary framing.  We scan for UTF-8 substrings that:
+      1. Contain one of the given keywords (case-insensitive)
+      2. Look like JSON (contain '{' or '[' near the keyword)
+
+    Returns up to 20 snippets of ≤300 chars each.
+    """
+    import re as _re
+
+    results: list[str] = []
+    if not ldb_dir.exists():
+        return results
+
+    ldb_kw = [k.lower().encode() for k in keywords]
+
+    for fname in sorted(ldb_dir.iterdir()):
+        if fname.suffix not in (".ldb", ".log"):
+            continue
+        try:
+            data = fname.read_bytes()
+        except OSError:
+            continue
+
+        data_lower = data.lower()
+        for kw in ldb_kw:
+            pos = 0
+            while True:
+                idx = data_lower.find(kw, pos)
+                if idx == -1:
+                    break
+                # Extract a window around the keyword
+                start = max(0, idx - 100)
+                end   = min(len(data), idx + 200)
+                chunk = data[start:end]
+                # Decode as ASCII-safe printable string
+                try:
+                    text = chunk.decode("utf-8", errors="replace")
+                except Exception:
+                    text = chunk.decode("ascii", errors="replace")
+                # Keep only if it contains JSON-like content near keyword
+                if "{" in text or "[" in text or ":" in text:
+                    snippet = _re.sub(r"[^\x20-\x7e]", "·", text).strip()
+                    if snippet and snippet not in results:
+                        results.append(f"[{fname.name}] …{snippet}…")
+                    if len(results) >= 20:
+                        return results
+                pos = idx + 1
+
+    return results
+
+
 def _get_claude_desktop_userdata_dirs() -> list[Path]:
     """
     Return directories that look like Claude Desktop Electron userData
@@ -1100,6 +1155,13 @@ def _diagnose_alt_auth(userdata_dirs: list[Path]) -> list[str]:
             size = nc.stat().st_size
             sqlite_ok = _is_sqlite(nc)
             lines.append(f"    exists: yes  size: {size}  sqlite: {sqlite_ok}")
+            # Show first 16 bytes so we can identify the file format
+            try:
+                with open(nc, "rb") as fh:
+                    first_bytes = fh.read(16)
+                lines.append(f"    first_bytes: {first_bytes.hex()}")
+            except OSError as exc:
+                lines.append(f"    first_bytes: (error: {exc})")
         else:
             lines.append("    exists: NO")
         # Also legacy path
@@ -1172,6 +1234,23 @@ def _diagnose_alt_auth(userdata_dirs: list[Path]) -> list[str]:
             for url, data in result["_raw"].items():
                 lines.append(f"    {url}")
                 lines.append(f"      {str(data)[:300]}")
+
+    # ── F. LevelDB raw scan ───────────────────────────────────────────────────
+    lines.append("\n=== F. Local Storage LevelDB scan ===")
+    USAGE_KEYWORDS = [
+        "usage", "rate_limit", "ratelimit", "5h", "7d",
+        "remaining", "pct", "quota", "session", "auth",
+        "cookie", "token", "claude", "anthropic",
+    ]
+    for d in userdata_dirs:
+        ldb_dir = d / "Local Storage" / "leveldb"
+        snippets = _scan_leveldb_for_strings(ldb_dir, USAGE_KEYWORDS)
+        lines.append(f"  {ldb_dir}")
+        if snippets:
+            for s in snippets:
+                lines.append(f"    {s[:300]}")
+        else:
+            lines.append("    (no matching strings found)")
 
     return lines
 
