@@ -52,8 +52,12 @@ _TIMEOUT = 10
 def _claude_base_dirs() -> list[Path]:
     """
     Return candidate directories where Claude Desktop might store its Electron
-    data.  We try multiple app-name spellings because Electron uses the value
-    of ``app.getName()`` (from package.json) which varies between builds.
+    userData.  Covers:
+    - Standard Electron: %APPDATA%\Claude  (Roaming)
+    - Non-standard:      %LOCALAPPDATA%\Claude
+    - MSIX/Store apps:   %LOCALAPPDATA%\Packages\<Anthropic.Claude_*>\LocalCache\Roaming\Claude
+    - Squirrel installs: %LOCALAPPDATA%\AnthropicClaude\app-*\resources
+      (not userData, but we check anyway)
     """
     candidates: list[Path] = []
     for env in ("APPDATA", "LOCALAPPDATA"):
@@ -67,7 +71,61 @@ def _claude_base_dirs() -> list[Path]:
             "AnthropicClaude", r"Anthropic\Claude",
         ):
             candidates.append(bp / name)
+
+    # MSIX / Windows Store isolation:
+    # %LOCALAPPDATA%\Packages\Anthropic.Claude_<hash>\LocalCache\Roaming\Claude
+    local = os.environ.get("LOCALAPPDATA", "")
+    if local:
+        packages = Path(local) / "Packages"
+        if packages.exists():
+            try:
+                for pkg in packages.iterdir():
+                    if pkg.is_dir() and any(
+                        kw in pkg.name.lower() for kw in ("claude", "anthropic")
+                    ):
+                        # Common MSIX userData paths
+                        for sub in (
+                            r"LocalCache\Roaming\Claude",
+                            r"LocalCache\Local\Claude",
+                            r"LocalState\Claude",
+                            r"RoamingState\Claude",
+                            "LocalCache",
+                            "LocalState",
+                        ):
+                            candidates.append(pkg / sub)
+            except OSError:
+                pass
+
     return candidates
+
+
+def _find_local_state_files_broadly() -> list[Path]:
+    """
+    Scan %APPDATA% and %LOCALAPPDATA% up to 5 levels deep for any
+    'Local State' file.  Used in diagnostics to locate non-standard
+    Electron userData paths.
+    """
+    results: list[Path] = []
+    for env in ("APPDATA", "LOCALAPPDATA"):
+        base = os.environ.get(env, "")
+        if not base:
+            continue
+        try:
+            for p in Path(base).rglob("Local State"):
+                if p.is_file():
+                    # Quick sanity check: valid JSON with os_crypt key
+                    try:
+                        with open(p, "r", encoding="utf-8") as f:
+                            data = json.load(f)
+                        if "os_crypt" in data or "browser" in data:
+                            results.append(p)
+                    except Exception:
+                        pass
+                if len(results) > 20:   # safety limit
+                    return results
+        except OSError:
+            pass
+    return results
 
 
 def _is_sqlite(path: Path) -> bool:
@@ -553,80 +611,104 @@ def is_available() -> bool:
     return bool(_find_cookies_file() and _find_local_state())
 
 
+def _dir_tree(root: Path, max_depth: int = 3, _depth: int = 0) -> list[str]:
+    """Return indented tree lines for *root*, up to *max_depth* levels."""
+    lines: list[str] = []
+    indent = "  " * _depth
+    try:
+        entries = sorted(root.iterdir())
+    except (PermissionError, OSError):
+        return [f"{indent}  (permission denied)"]
+    for entry in entries[:30]:
+        suffix = "\\" if entry.is_dir() else ""
+        lines.append(f"{indent}  {entry.name}{suffix}")
+        if entry.is_dir() and _depth < max_depth - 1:
+            lines.extend(_dir_tree(entry, max_depth, _depth + 1))
+    if len(entries) > 30:
+        lines.append(f"{indent}  … ({len(entries) - 30} more)")
+    return lines
+
+
 def diagnose() -> str:
     """Return a human-readable diagnostic string for the Settings window."""
     lines: list[str] = []
 
-    # ── 1. Claude Desktop base directories ───────────────────────────────────
+    # ── 1. Claude Desktop candidate directories ───────────────────────────────
     claude_dirs = _claude_base_dirs()
-    existing_claude = [d for d in claude_dirs if d.exists()]
-    lines.append("Claude Desktop candidate dirs checked:")
+    existing = [d for d in claude_dirs if d.exists()]
+    lines.append("Claude Desktop candidate dirs:")
     for d in claude_dirs:
         lines.append(f"  {'[OK]' if d.exists() else '[  ]'} {d}")
 
-    if existing_claude:
-        lines.append("\nContents of existing Claude dirs:")
-        for d in existing_claude:
-            try:
-                children = sorted(d.iterdir())[:20]
-                for c in children:
-                    lines.append(f"  {d.name}\\{c.name}{'\\' if c.is_dir() else ''}")
-                if len(list(d.iterdir())) > 20:
-                    lines.append(f"  … (truncated)")
-            except PermissionError:
-                lines.append(f"  (permission denied)")
+    if existing:
+        lines.append("\nContents (3 levels deep):")
+        for d in existing:
+            lines.append(f"\n  {d}")
+            tree = _dir_tree(d, max_depth=3)
+            if tree:
+                lines.extend(tree)
+            else:
+                lines.append("    (empty)")
 
-    # ── 2. All Chromium profiles found ────────────────────────────────────────
+    # ── 2. Broad 'Local State' search ─────────────────────────────────────────
+    lines.append("\nSearching all of %APPDATA% + %LOCALAPPDATA% for 'Local State'…")
+    all_ls = _find_local_state_files_broadly()
+    if all_ls:
+        lines.append(f"Found {len(all_ls)} Local State file(s):")
+        for p in all_ls:
+            lines.append(f"  {p}")
+    else:
+        lines.append("  None found (no Chromium-based app is signed in?)")
+
+    # ── 3. Chromium profiles with Cookies ─────────────────────────────────────
     profiles = _candidate_chromium_profiles()
-    lines.append(f"\nChromium profiles with Cookies + Local State: {len(profiles)}")
+    lines.append(f"\nChromium profiles (Cookies + Local State): {len(profiles)}")
     for ls, c in profiles:
-        lines.append(f"  Local State: {ls}")
-        lines.append(f"  Cookies:     {c}")
+        lines.append(f"  {c}")
 
     if not profiles:
         lines.append(
-            "\n→ No Chromium session found.\n"
-            "  Make sure you are signed in to claude.ai in Chrome / Edge / Brave,\n"
-            "  or have Claude Desktop installed and signed in."
+            "\n→ No usable Chromium session found.\n"
+            "  • If Claude Desktop stores data via MSIX/Store, it may be in\n"
+            "    %LOCALAPPDATA%\\Packages\\<Anthropic...>\\LocalCache\\...\n"
+            "  • Check the 'Local State' search above for clues."
         )
         return "\n".join(lines)
 
-    # ── 3. Cookie decryption ──────────────────────────────────────────────────
+    # ── 4. Cookie decryption ──────────────────────────────────────────────────
     total_cookies = 0
-    cookie_names: list[str] = []
     for ls, c in profiles:
         key = _get_aes_key_from(ls)
-        if key is None:
-            lines.append(f"\nAES key: FAILED for {ls.parent.name} (pywin32 installed?)")
-            continue
-        cookies = _read_cookies_from(ls, c)
-        lines.append(f"\nProfile {c.parent.parent.name}\\{c.parent.name}\\{c.name}:")
-        lines.append(f"  AES key: OK")
-        lines.append(f"  claude.ai cookies: {len(cookies)}"
-                     + (f" ({', '.join(list(cookies)[:5])})" if cookies else ""))
+        status = "OK" if key else "FAILED (pywin32?)"
+        cookies = _read_cookies_from(ls, c) if key else {}
+        lines.append(
+            f"\n  {c.parent.parent.name}\\{c.parent.name}\\{c.name}:"
+            f"\n    AES key: {status}"
+            f"\n    claude.ai cookies: {len(cookies)}"
+            + (f" ({', '.join(list(cookies)[:5])})" if cookies else "")
+        )
         total_cookies += len(cookies)
-        cookie_names.extend(cookies.keys())
 
     if total_cookies == 0:
         lines.append(
-            "\n→ No claude.ai cookies found in any profile.\n"
-            "  Please sign in to claude.ai in your browser and try again."
+            "\n→ No claude.ai cookies found.\n"
+            "  The 'Local State' search above may show where\n"
+            "  Claude Desktop actually stores its session data."
         )
         return "\n".join(lines)
 
-    # ── 4. API call ───────────────────────────────────────────────────────────
+    # ── 5. API call ───────────────────────────────────────────────────────────
     lines.append("\nTrying claude.ai API endpoints…")
     result = fetch_usage()
     if result["error"]:
         lines.append(f"Error: {result['error']}")
     else:
-        lines.append(f"✓ pct_5h = {result['pct_5h']}")
-        lines.append(f"✓ pct_7d = {result['pct_7d']}")
+        lines.append(f"pct_5h = {result['pct_5h']}")
+        lines.append(f"pct_7d = {result['pct_7d']}")
 
     if result.get("_raw"):
         lines.append("\nRaw API responses:")
         for url, data in result["_raw"].items():
-            lines.append(f"  {url}:")
-            lines.append(f"    {str(data)[:200]}")
+            lines.append(f"  {url}: {str(data)[:200]}")
 
     return "\n".join(lines)
