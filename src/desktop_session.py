@@ -386,7 +386,7 @@ def get_claude_cookies() -> dict[str, str]:
 # Known (or likely) endpoints Claude Desktop / claude.ai uses for usage data.
 # We try each in order and stop at the first successful JSON response that
 # contains recognisable usage fields.
-_CANDIDATE_ENDPOINTS = [
+_CANDIDATE_ENDPOINTS_COOKIE = [
     "https://claude.ai/api/usage_status",
     "https://claude.ai/api/usage",
     "https://claude.ai/api/account",
@@ -394,6 +394,22 @@ _CANDIDATE_ENDPOINTS = [
     "https://claude.ai/api/rate_limit_status",
     "https://claude.ai/api/organizations/current/usage",
 ]
+
+# Endpoints to try when authenticating via the Anthropic API OAuth token.
+# These are probed in order; first successful parse wins.
+_CANDIDATE_ENDPOINTS_OAUTH = [
+    # Claude.ai web API (token as Bearer)
+    "https://claude.ai/api/usage_status",
+    "https://claude.ai/api/rate_limit_status",
+    "https://claude.ai/api/account",
+    "https://claude.ai/api/organizations/current/usage",
+    # Anthropic public API
+    "https://api.anthropic.com/v1/usage",
+    "https://api.anthropic.com/v1/account",
+]
+
+# Keep the old name as an alias so existing callers still work.
+_CANDIDATE_ENDPOINTS = _CANDIDATE_ENDPOINTS_COOKIE
 
 
 def _cookie_header(cookies: dict[str, str]) -> str:
@@ -595,11 +611,38 @@ def get_oauth_token() -> Optional[dict]:
     return None
 
 
-def _headers_for_oauth(token: dict) -> dict:
+def _extract_token_value(token_cache: dict) -> str:
     """
-    Build HTTP headers for claude.ai using a decrypted OAuth token dict.
-    Tries common key names for access tokens and session tokens.
+    The oauth:tokenCache dict may have one entry whose key is
+    '{user-uuid}:{workspace-uuid}:{api-base-url}' and whose value is
+    a dict like {'token': 'sk-ant-...'} or a plain string.
+    Extract the actual token string.
     """
+    # Direct flat keys
+    for k in ("access_token", "accessToken", "token", "session_token", "sessionToken"):
+        v = token_cache.get(k)
+        if v and isinstance(v, str):
+            return v
+
+    # Namespaced key pattern (Claude Desktop MSIX format)
+    for v in token_cache.values():
+        if isinstance(v, dict):
+            for k in ("token", "access_token", "accessToken"):
+                if k in v and isinstance(v[k], str):
+                    return v[k]
+        elif isinstance(v, str) and v:
+            return v
+
+    return ""
+
+
+def _headers_for_oauth(token_cache: dict) -> dict:
+    """
+    Build HTTP headers for API calls using a decrypted OAuth token dict.
+    Supports both flat {'access_token': '...'} and namespaced
+    {'{uuid}:{uuid}:{url}': {'token': '...'}} formats.
+    """
+    access = _extract_token_value(token_cache)
     headers: dict[str, str] = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -610,27 +653,11 @@ def _headers_for_oauth(token: dict) -> dict:
         "Referer": "https://claude.ai/",
         "Origin": "https://claude.ai",
     }
-
-    # Bearer token (Anthropic API / oauth flow)
-    access = (
-        token.get("access_token")
-        or token.get("accessToken")
-        or token.get("token")
-        or ""
-    )
     if access:
         headers["Authorization"] = f"Bearer {access}"
-
-    # Session cookie equivalent
-    session = (
-        token.get("session_token")
-        or token.get("sessionToken")
-        or token.get("__Secure-next-auth.session-token")
-        or ""
-    )
-    if session:
-        headers["Cookie"] = f"__Secure-next-auth.session-token={session}"
-
+        # Also try as x-api-key (Anthropic API style)
+        headers["x-api-key"] = access
+        headers["anthropic-version"] = "2023-06-01"
     return headers
 
 
@@ -685,10 +712,22 @@ def fetch_usage() -> dict:
         headers = _headers_for_oauth(oauth)  # type: ignore[arg-type]
 
     raw_responses: dict[str, object] = {}
+    endpoints = _CANDIDATE_ENDPOINTS_OAUTH if oauth else _CANDIDATE_ENDPOINTS_COOKIE
 
-    for url in _CANDIDATE_ENDPOINTS:
+    for url in endpoints:
         try:
-            resp = requests.get(url, headers=headers, timeout=_TIMEOUT)
+            try:
+                resp = requests.get(url, headers=headers, timeout=_TIMEOUT)
+            except requests.exceptions.SSLError:
+                # Corporate proxy / custom CA not in Python's bundle.
+                # Retry without certificate verification (connection is still
+                # encrypted; only the cert chain is not validated).
+                import urllib3  # type: ignore
+                urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+                resp = requests.get(
+                    url, headers=headers, timeout=_TIMEOUT, verify=False
+                )
+
             if resp.status_code in (401, 403):
                 empty["error"] = (
                     "Session expired or not authenticated. "
@@ -709,6 +748,8 @@ def fetch_usage() -> dict:
                     usage["error"] = None
                     usage["_raw"] = raw_responses
                     return usage
+            else:
+                raw_responses[url] = f"HTTP {resp.status_code}"
 
         except requests.RequestException as exc:
             raw_responses[url] = str(exc)
