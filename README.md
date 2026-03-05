@@ -27,8 +27,8 @@ Claude Code stores all conversation history locally in `~/.claude/projects/` as 
 ## Installation (from source)
 
 ```cmd
-git clone https://github.com/your-user/claude-usage-monitor.git
-cd claude-usage-monitor
+git clone https://github.com/Yomgui33/Claude-usage.git
+cd claude-usage
 pip install -r requirements.txt
 python main.py
 ```
