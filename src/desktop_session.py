@@ -612,8 +612,10 @@ def is_available() -> bool:
 
 
 import re as _re
+# Match UUID-like hex-dash names: standard 8-4-4-4-12 OR
+# non-standard first segment (Electron sometimes uses 9-char first segment).
 _UUID_RE = _re.compile(
-    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", _re.I
+    r"^[0-9a-f]{6,12}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$", _re.I
 )
 
 
@@ -659,64 +661,112 @@ def _read_text_file(p: Path, max_bytes: int = 1024) -> str:
         return f"(error: {exc})"
 
 
+_SEP = "\\"
+
+
 def _inspect_claude_desktop_dir(d: Path) -> list[str]:
     """
-    Extra inspection for a known Claude Desktop userData directory.
-    Shows deeper tree, UUID partition contents, and key file contents.
+    Focused inspection for a Claude Desktop MSIX userData directory.
+    Avoids dumping the entire 5-level tree; instead zooms in on what matters:
+    - Top-level file list (1 level, skip Cache / Code Cache noise)
+    - Contents of key auth files: ant-did, claude_desktop_config.json …
+    - UUID-like partition sub-dirs: 2-level tree + Cookies / Local State probe
+    - Session dirs: list sub-entries + read small files
     """
     lines: list[str] = []
+    lines.append(f"\n  {d}")
 
-    # Deeper tree for the whole dir (5 levels)
-    lines.append(f"\n  {d}  [5-level tree]")
-    lines.extend(_dir_tree(d, max_depth=5))
+    # ── Top-level listing (skip large cache dirs) ─────────────────────────────
+    _SKIP = {"cache", "code cache", "gpucache", "dawncache", "no_vary_search"}
+    try:
+        entries = sorted(d.iterdir())
+    except OSError:
+        entries = []
+    for entry in entries:
+        try:
+            is_dir = entry.is_dir()
+        except OSError:
+            lines.append(f"    {entry.name}  (inaccessible)")
+            continue
+        suffix = _SEP if is_dir else ""
+        lines.append(f"    {entry.name}{suffix}")
 
-    # Show contents of key files
-    for name in ("ant-did", "claude_desktop_config.json", "config.json", "auth.json"):
+    # ── Key auth files ────────────────────────────────────────────────────────
+    for name in (
+        "ant-did",
+        "claude_desktop_config.json",
+        "config.json",
+        "auth.json",
+        "credentials.json",
+    ):
         f = d / name
-        if f.exists():
-            lines.append(f"\n  Contents of {name}:")
-            for ln in _read_text_file(f).splitlines():
+        if f.exists() and f.is_file():
+            lines.append(f"\n  >>> {name} <<<")
+            for ln in _read_text_file(f, max_bytes=2048).splitlines():
                 lines.append(f"    {ln}")
 
-    # Show session files in de-sessions\ or sessions\
-    _SEP = "\\"
-    for sdir_name in ("de-sessions", "sessions", "claude-sessions", "node-sessions"):
-        sdir = d / sdir_name
-        if sdir.exists():
-            lines.append(f"\n  {sdir_name}{_SEP}:")
-            try:
-                for entry in sorted(sdir.iterdir())[:5]:
-                    suffix = _SEP if entry.is_dir() else ""
-                    lines.append(f"    {entry.name}{suffix}")
-                    if entry.is_file():
-                        lines.append(f"      {_read_text_file(entry, 512)[:200]}")
-                    elif entry.is_dir():
-                        for sub in sorted(entry.iterdir())[:3]:
-                            ssuffix = _SEP if sub.is_dir() else ""
-                            lines.append(f"      {sub.name}{ssuffix}")
-                            if sub.is_file():
-                                lines.append(
-                                    f"        {_read_text_file(sub, 512)[:200]}"
-                                )
-            except OSError:
-                pass
+    # ── UUID-like partition directories ───────────────────────────────────────
+    for entry in entries:
+        try:
+            is_dir = entry.is_dir()
+        except OSError:
+            continue
+        if not is_dir or not _UUID_RE.match(entry.name):
+            continue
+        lines.append(f"\n  Partition {entry.name}{_SEP}")
+        lines.extend(_dir_tree(entry, max_depth=2))
+        # Probe for Chromium session files anywhere inside
+        for rel in (
+            "Local State",
+            "Cookies",
+            r"Network\Cookies",
+            r"Default\Cookies",
+            r"Default\Network\Cookies",
+            r"Default\Local State",
+        ):
+            probe = entry / rel
+            if probe.exists():
+                lines.append(f"    *** Found: {rel} ***")
 
-    # Inspect UUID-named partition directories
-    try:
-        for entry in d.iterdir():
-            if entry.is_dir() and _UUID_RE.match(entry.name):
-                lines.append(f"\n  Partition {entry.name}{_SEP} [4-level tree]:")
-                lines.extend(_dir_tree(entry, max_depth=4))
-                # Look for key files inside partition
-                for name in ("Local State", "Cookies"):
-                    f = entry / name
-                    if f.exists():
-                        lines.append(f"    -> Found {name}!")
-                    f2 = entry / "Network" / name
-                    if f2.exists():
-                        lines.append(f"    -> Found Network{_SEP}{name}!")
-    except OSError:
-        pass
+    # ── Session directories ───────────────────────────────────────────────────
+    for sdir_name in (
+        "de-sessions",
+        "sessions",
+        "claude-sessions",
+        "node-sessions",
+        "local-agent-mode-sessions",
+    ):
+        sdir = d / sdir_name
+        if not sdir.exists():
+            continue
+        lines.append(f"\n  {sdir_name}{_SEP}")
+        try:
+            for entry in sorted(sdir.iterdir())[:5]:
+                try:
+                    is_dir = entry.is_dir()
+                except OSError:
+                    lines.append(f"    {entry.name}  (inaccessible)")
+                    continue
+                suffix = _SEP if is_dir else ""
+                lines.append(f"    {entry.name}{suffix}")
+                if not is_dir:
+                    snippet = _read_text_file(entry, 512)[:200].replace("\n", " ")
+                    lines.append(f"      {snippet}")
+                else:
+                    for sub in sorted(entry.iterdir())[:4]:
+                        try:
+                            sub_is_dir = sub.is_dir()
+                        except OSError:
+                            continue
+                        ssuffix = _SEP if sub_is_dir else ""
+                        lines.append(f"      {sub.name}{ssuffix}")
+                        if not sub_is_dir:
+                            snippet = _read_text_file(sub, 512)[:200].replace(
+                                "\n", " "
+                            )
+                            lines.append(f"        {snippet}")
+        except OSError:
+            pass
 
     return lines
 
