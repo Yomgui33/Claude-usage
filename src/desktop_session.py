@@ -398,6 +398,11 @@ _CANDIDATE_ENDPOINTS_COOKIE = [
 # Endpoints to try when authenticating via the Anthropic API OAuth token.
 # These are probed in order; first successful parse wins.
 _CANDIDATE_ENDPOINTS_OAUTH = [
+    # Standard OAuth 2.0 userinfo endpoint – returns user/account info for
+    # the token's owner and may include subscription/usage data.
+    "https://api.anthropic.com/oauth/userinfo",
+    # Anthropic internal API endpoints to probe.
+    "https://api.anthropic.com/v1/me",
     # Claude.ai web API (token as Bearer)
     "https://claude.ai/api/usage_status",
     "https://claude.ai/api/rate_limit_status",
@@ -532,6 +537,22 @@ def _extract_usage(data: object, depth: int = 0) -> Optional[dict]:
         lower.get("reset_7d") or lower.get("7d_reset") or lower.get("window_7d_reset")
     )
 
+    # --- Message-based limits (Claude Pro / non-Max plans) ---
+    # Claude Pro uses a daily message count rather than token windows.
+    msg_used  = lower.get("messages_used") or lower.get("message_count") or lower.get("messages_consumed")
+    msg_limit = lower.get("messages_limit") or lower.get("message_limit") or lower.get("daily_message_limit")
+    if msg_used is not None and msg_limit:
+        try:
+            pct_5h = min(100.0, float(msg_used) / float(msg_limit) * 100)
+        except (ZeroDivisionError, TypeError):
+            pass
+
+    # Generic used/limit pair at the top level
+    if pct_5h is None:
+        pct_5h = _used_limit_pct("message", "msg", "daily", "request")
+    if pct_7d is None:
+        pct_7d = _used_limit_pct("weekly", "week", "monthly", "month")
+
     if pct_5h is not None or pct_7d is not None:
         return {
             "pct_5h":   pct_5h,
@@ -545,6 +566,76 @@ def _extract_usage(data: object, depth: int = 0) -> Optional[dict]:
         result = _extract_usage(v, depth + 1)
         if result:
             return result
+
+    return None
+
+
+def _scrape_usage_page(headers: dict) -> Optional[dict]:
+    """
+    Attempt to scrape https://claude.ai/settings/usage as an HTML page.
+
+    If the page is SSR-rendered (Next.js), the usage data is embedded in a
+    <script id="__NEXT_DATA__"> JSON blob.  We parse that blob and run it
+    through _extract_usage().
+
+    Works only if the provided headers include a valid session cookie or a
+    Bearer token that the claude.ai SSR layer accepts.
+    """
+    import re as _re
+
+    scrape_headers = {
+        **headers,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
+    }
+    try:
+        try:
+            resp = requests.get(
+                "https://claude.ai/settings/usage",
+                headers=scrape_headers,
+                timeout=_TIMEOUT,
+                allow_redirects=True,
+            )
+        except requests.exceptions.SSLError:
+            import urllib3  # type: ignore
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+            resp = requests.get(
+                "https://claude.ai/settings/usage",
+                headers=scrape_headers,
+                timeout=_TIMEOUT,
+                allow_redirects=True,
+                verify=False,
+            )
+    except requests.RequestException:
+        return None
+
+    if not resp.ok:
+        return None
+
+    html = resp.text
+
+    # 1. __NEXT_DATA__ blob (SSR data)
+    m = _re.search(r'<script[^>]+id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>', html, _re.S)
+    if m:
+        try:
+            import json as _json
+            blob = _json.loads(m.group(1))
+            usage = _extract_usage(blob)
+            if usage:
+                return usage
+        except Exception:
+            pass
+
+    # 2. Inline JSON objects anywhere in the page
+    for candidate in _re.findall(r'\{[^{}]{20,}(?:pct|usage|remaining|limit)[^{}]{0,200}\}', html):
+        try:
+            import json as _json
+            obj = _json.loads(candidate)
+            usage = _extract_usage(obj)
+            if usage:
+                return usage
+        except Exception:
+            pass
 
     return None
 
@@ -655,6 +746,71 @@ def _scan_leveldb_for_strings(ldb_dir: Path, keywords: list[str]) -> list[str]:
                 pos = idx + 1
 
     return results
+
+
+def _extract_user_traits_from_leveldb(ldb_dir: Path) -> dict:
+    """
+    Parse the `ajs_user_traits` JSON blob stored in Claude Desktop's Local
+    Storage LevelDB.  This contains subscription/plan info written by the
+    Segment.io analytics SDK.
+
+    Returns a dict with keys like:
+      email, org_type, billing_type, subscription_plan, plan,
+      organization_uuid, account_created_at
+    or {} if not found.
+    """
+    import json as _json
+    import re as _re
+
+    if not ldb_dir.exists():
+        return {}
+
+    key = b"ajs_user_traits"
+    for fname in sorted(ldb_dir.iterdir()):
+        if fname.suffix not in (".ldb", ".log"):
+            continue
+        try:
+            data = fname.read_bytes()
+        except OSError:
+            continue
+
+        idx = data.lower().find(key)
+        if idx == -1:
+            continue
+
+        # The value follows the key in LevelDB; scan forward for the JSON object
+        window = data[idx: idx + 2000]
+        try:
+            text = window.decode("utf-8", errors="replace")
+        except Exception:
+            continue
+
+        # Find the first '{' after the key
+        j = text.find("{")
+        if j == -1:
+            continue
+        # Find matching closing brace
+        depth = 0
+        end = j
+        for i, ch in enumerate(text[j:], j):
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    end = i
+                    break
+        json_str = text[j: end + 1]
+        # Remove replacement characters from binary framing
+        json_str = _re.sub(r"[\x00-\x1f\x7f-\x9f\ufffd]", " ", json_str)
+        try:
+            traits = _json.loads(json_str)
+            if isinstance(traits, dict) and ("org_type" in traits or "email" in traits):
+                return traits
+        except Exception:
+            pass
+
+    return {}
 
 
 def _get_claude_desktop_userdata_dirs() -> list[Path]:
@@ -931,6 +1087,24 @@ def fetch_usage() -> dict:
 
         except requests.RequestException as exc:
             raw_responses[url] = str(exc)
+
+    # API endpoints exhausted — try scraping the settings/usage HTML page.
+    # The page may have usage data embedded in the Next.js SSR blob.
+    scrape_headers = headers if cookies else {
+        "Authorization": f"Bearer {_extract_token_value(oauth)}",  # type: ignore[arg-type]
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/144.0.7559.173 Electron/40.4.1 Safari/537.36"
+        ),
+        "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
+        "Referer": "https://claude.ai/",
+    }
+    usage = _scrape_usage_page(scrape_headers)
+    if usage:
+        usage["error"] = None
+        usage["_raw"] = raw_responses
+        return usage
 
     empty["_raw"] = raw_responses
     empty["error"] = (
@@ -1237,20 +1411,34 @@ def _diagnose_alt_auth(userdata_dirs: list[Path]) -> list[str]:
 
     # ── F. LevelDB raw scan ───────────────────────────────────────────────────
     lines.append("\n=== F. Local Storage LevelDB scan ===")
-    USAGE_KEYWORDS = [
-        "usage", "rate_limit", "ratelimit", "5h", "7d",
-        "remaining", "pct", "quota", "session", "auth",
-        "cookie", "token", "claude", "anthropic",
-    ]
     for d in userdata_dirs:
         ldb_dir = d / "Local Storage" / "leveldb"
-        snippets = _scan_leveldb_for_strings(ldb_dir, USAGE_KEYWORDS)
         lines.append(f"  {ldb_dir}")
+
+        # Extract user/subscription traits first
+        traits = _extract_user_traits_from_leveldb(ldb_dir)
+        if traits:
+            lines.append("  User traits from ajs_user_traits:")
+            for tk in ("email", "org_type", "billing_type", "subscription_plan",
+                       "plan", "organization_uuid", "account_created_at"):
+                if tk in traits:
+                    lines.append(f"    {tk}: {traits[tk]}")
+        else:
+            lines.append("  (ajs_user_traits not found)")
+
+        # Raw keyword scan for usage/rate-limit data
+        USAGE_KEYWORDS = [
+            "messages_used", "messages_limit", "message_limit",
+            "usage", "rate_limit", "ratelimit", "5h", "7d",
+            "remaining", "pct", "quota", "daily_limit",
+        ]
+        snippets = _scan_leveldb_for_strings(ldb_dir, USAGE_KEYWORDS)
         if snippets:
+            lines.append("  Keyword matches:")
             for s in snippets:
                 lines.append(f"    {s[:300]}")
         else:
-            lines.append("    (no matching strings found)")
+            lines.append("  (no usage/rate-limit strings found)")
 
     return lines
 
