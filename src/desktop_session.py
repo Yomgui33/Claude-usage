@@ -403,9 +403,9 @@ _CANDIDATE_ENDPOINTS_OAUTH = [
     "https://claude.ai/api/rate_limit_status",
     "https://claude.ai/api/account",
     "https://claude.ai/api/organizations/current/usage",
-    # Anthropic public API
-    "https://api.anthropic.com/v1/usage",
-    "https://api.anthropic.com/v1/account",
+    # Anthropic public API – /v1/models always returns 200 for valid keys;
+    # its response headers carry anthropic-ratelimit-* usage information.
+    "https://api.anthropic.com/v1/models",
 ]
 
 # Keep the old name as an alias so existing callers still work.
@@ -545,6 +545,59 @@ def _extract_usage(data: object, depth: int = 0) -> Optional[dict]:
         result = _extract_usage(v, depth + 1)
         if result:
             return result
+
+    return None
+
+
+def _extract_usage_from_headers(headers: dict) -> Optional[dict]:
+    """
+    Parse Anthropic API rate-limit response headers into a usage dict.
+
+    The Anthropic API returns headers like:
+        anthropic-ratelimit-tokens-limit: 80000
+        anthropic-ratelimit-tokens-remaining: 60000
+        anthropic-ratelimit-tokens-reset: 2026-03-05T16:00:00Z
+        anthropic-ratelimit-output-tokens-limit: 16000
+        anthropic-ratelimit-output-tokens-remaining: 12000
+        ...
+
+    For Claude Max the window of interest is typically 5 hours for tokens
+    and 7 days for a broader limit.  We report whichever limits exist.
+    """
+    h = {k.lower(): v for k, v in headers.items()}
+
+    def _int(key: str) -> Optional[int]:
+        val = h.get(key)
+        if val is None:
+            return None
+        try:
+            return int(val)
+        except (ValueError, TypeError):
+            return None
+
+    # Prefer "output-tokens" window (maps to the 5-hour UI counter).
+    # Fall back to generic "tokens" window.
+    for prefix in (
+        "anthropic-ratelimit-output-tokens",
+        "anthropic-ratelimit-tokens",
+        "anthropic-ratelimit-requests",
+    ):
+        limit = _int(f"{prefix}-limit")
+        remaining = _int(f"{prefix}-remaining")
+        reset_raw = h.get(f"{prefix}-reset")
+        if limit and remaining is not None:
+            used = limit - remaining
+            pct_5h = min(100.0, used / limit * 100) if limit else None
+            reset_5h = _parse_timedelta(reset_raw)
+            return {
+                "pct_5h": pct_5h,
+                "pct_7d": None,
+                "reset_5h": reset_5h,
+                "reset_7d": None,
+                "_header_prefix": prefix,
+                "_limit": limit,
+                "_remaining": remaining,
+            }
 
     return None
 
@@ -712,7 +765,27 @@ def fetch_usage() -> dict:
         headers = _headers_for_oauth(oauth)  # type: ignore[arg-type]
 
     raw_responses: dict[str, object] = {}
-    endpoints = _CANDIDATE_ENDPOINTS_OAUTH if oauth else _CANDIDATE_ENDPOINTS_COOKIE
+
+    if oauth:
+        # Build the endpoint list dynamically so we can inject the real org ID.
+        # The oauth:tokenCache key format is "{user-uuid}:{org-uuid}:{api-url}".
+        # We extract the org UUID and probe the org-specific usage endpoint
+        # that powers https://claude.ai/settings/usage.
+        endpoints: list[str] = list(_CANDIDATE_ENDPOINTS_OAUTH)
+        for token_key in oauth:  # type: ignore[union-attr]
+            parts = str(token_key).split(":")
+            # parts[0] = user-uuid, parts[1] = org-uuid
+            if len(parts) >= 2:
+                org_id = parts[1]
+                if org_id and len(org_id) == 36:  # sanity: looks like a UUID
+                    org_url = (
+                        f"https://claude.ai/api/organizations/{org_id}/usage"
+                    )
+                    if org_url not in endpoints:
+                        endpoints.insert(0, org_url)
+                    break
+    else:
+        endpoints = _CANDIDATE_ENDPOINTS_COOKIE
 
     for url in endpoints:
         # For OAuth, use minimal headers for api.anthropic.com so we don't
@@ -754,6 +827,20 @@ def fetch_usage() -> dict:
                 return empty
 
             if resp.ok:
+                # First, try rate-limit headers (Anthropic API endpoints).
+                usage = _extract_usage_from_headers(dict(resp.headers))
+                if usage:
+                    raw_responses[url] = {
+                        "status": resp.status_code,
+                        "ratelimit_headers": {
+                            k: v for k, v in resp.headers.items()
+                            if k.lower().startswith("anthropic-ratelimit")
+                        },
+                    }
+                    usage["error"] = None
+                    usage["_raw"] = raw_responses
+                    return usage
+
                 try:
                     data = resp.json()
                 except ValueError:
