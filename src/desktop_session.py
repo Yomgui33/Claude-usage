@@ -611,6 +611,12 @@ def is_available() -> bool:
     return bool(_find_cookies_file() and _find_local_state())
 
 
+import re as _re
+_UUID_RE = _re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", _re.I
+)
+
+
 def _dir_tree(root: Path, max_depth: int = 3, _depth: int = 0) -> list[str]:
     """Return indented tree lines for *root*, up to *max_depth* levels."""
     lines: list[str] = []
@@ -629,6 +635,87 @@ def _dir_tree(root: Path, max_depth: int = 3, _depth: int = 0) -> list[str]:
     return lines
 
 
+def _read_text_file(p: Path, max_bytes: int = 1024) -> str:
+    """Read a text/JSON file; truncate and redact any long tokens."""
+    try:
+        raw = p.read_bytes()[:max_bytes]
+        text = raw.decode("utf-8", errors="replace")
+        # Redact strings longer than 40 chars that look like tokens
+        text = _re.sub(
+            r'("(?:token|key|secret|session|auth|jwt|access)[^"]*"\s*:\s*")[^"]{40,}(")',
+            r"\1<redacted>\2",
+            text,
+            flags=_re.IGNORECASE,
+        )
+        if len(raw) == max_bytes:
+            text += "\n… (truncated)"
+        return text
+    except Exception as exc:
+        return f"(error: {exc})"
+
+
+def _inspect_claude_desktop_dir(d: Path) -> list[str]:
+    """
+    Extra inspection for a known Claude Desktop userData directory.
+    Shows deeper tree, UUID partition contents, and key file contents.
+    """
+    lines: list[str] = []
+
+    # Deeper tree for the whole dir (5 levels)
+    lines.append(f"\n  {d}  [5-level tree]")
+    lines.extend(_dir_tree(d, max_depth=5))
+
+    # Show contents of key files
+    for name in ("ant-did", "claude_desktop_config.json", "config.json", "auth.json"):
+        f = d / name
+        if f.exists():
+            lines.append(f"\n  Contents of {name}:")
+            for ln in _read_text_file(f).splitlines():
+                lines.append(f"    {ln}")
+
+    # Show session files in de-sessions\ or sessions\
+    _SEP = "\\"
+    for sdir_name in ("de-sessions", "sessions", "claude-sessions", "node-sessions"):
+        sdir = d / sdir_name
+        if sdir.exists():
+            lines.append(f"\n  {sdir_name}{_SEP}:")
+            try:
+                for entry in sorted(sdir.iterdir())[:5]:
+                    suffix = _SEP if entry.is_dir() else ""
+                    lines.append(f"    {entry.name}{suffix}")
+                    if entry.is_file():
+                        lines.append(f"      {_read_text_file(entry, 512)[:200]}")
+                    elif entry.is_dir():
+                        for sub in sorted(entry.iterdir())[:3]:
+                            ssuffix = _SEP if sub.is_dir() else ""
+                            lines.append(f"      {sub.name}{ssuffix}")
+                            if sub.is_file():
+                                lines.append(
+                                    f"        {_read_text_file(sub, 512)[:200]}"
+                                )
+            except OSError:
+                pass
+
+    # Inspect UUID-named partition directories
+    try:
+        for entry in d.iterdir():
+            if entry.is_dir() and _UUID_RE.match(entry.name):
+                lines.append(f"\n  Partition {entry.name}{_SEP} [4-level tree]:")
+                lines.extend(_dir_tree(entry, max_depth=4))
+                # Look for key files inside partition
+                for name in ("Local State", "Cookies"):
+                    f = entry / name
+                    if f.exists():
+                        lines.append(f"    -> Found {name}!")
+                    f2 = entry / "Network" / name
+                    if f2.exists():
+                        lines.append(f"    -> Found Network{_SEP}{name}!")
+    except OSError:
+        pass
+
+    return lines
+
+
 def diagnose() -> str:
     """Return a human-readable diagnostic string for the Settings window."""
     lines: list[str] = []
@@ -640,15 +727,38 @@ def diagnose() -> str:
     for d in claude_dirs:
         lines.append(f"  {'[OK]' if d.exists() else '[  ]'} {d}")
 
-    if existing:
-        lines.append("\nContents (3 levels deep):")
-        for d in existing:
-            lines.append(f"\n  {d}")
-            tree = _dir_tree(d, max_depth=3)
-            if tree:
-                lines.extend(tree)
-            else:
-                lines.append("    (empty)")
+    # Identify which existing dirs look like Claude Desktop userData
+    # (have >1 subdir / have session-related contents rather than just Logs)
+    def _is_userdata(d: Path) -> bool:
+        try:
+            children = {c.name.lower() for c in d.iterdir()}
+        except OSError:
+            return False
+        return bool(
+            children - {"logs"}  # more than just a Logs dir
+            and any(
+                k in children
+                for k in (
+                    "cache", "code cache", "blob_storage",
+                    "si_0.indexeddb.leveldb", "de-sessions",
+                    "ant-did", "claude_desktop_config.json",
+                )
+            )
+        )
+
+    userdata_dirs = [d for d in existing if _is_userdata(d)]
+    plain_dirs    = [d for d in existing if not _is_userdata(d)]
+
+    if plain_dirs:
+        lines.append("\nStandard dirs (only Logs / empty):")
+        for d in plain_dirs:
+            lines.append(f"  {d}")
+            lines.extend(_dir_tree(d, max_depth=2))
+
+    if userdata_dirs:
+        lines.append("\n>>> Claude Desktop userData found — deep inspection <<<")
+        for d in userdata_dirs:
+            lines.extend(_inspect_claude_desktop_dir(d))
 
     # ── 2. Broad 'Local State' search ─────────────────────────────────────────
     lines.append("\nSearching all of %APPDATA% + %LOCALAPPDATA% for 'Local State'…")
@@ -658,7 +768,7 @@ def diagnose() -> str:
         for p in all_ls:
             lines.append(f"  {p}")
     else:
-        lines.append("  None found (no Chromium-based app is signed in?)")
+        lines.append("  None found")
 
     # ── 3. Chromium profiles with Cookies ─────────────────────────────────────
     profiles = _candidate_chromium_profiles()
@@ -668,10 +778,9 @@ def diagnose() -> str:
 
     if not profiles:
         lines.append(
-            "\n→ No usable Chromium session found.\n"
-            "  • If Claude Desktop stores data via MSIX/Store, it may be in\n"
-            "    %LOCALAPPDATA%\\Packages\\<Anthropic...>\\LocalCache\\...\n"
-            "  • Check the 'Local State' search above for clues."
+            "\n→ No Chromium cookie store found.\n"
+            "  Claude Desktop (MSIX) likely stores auth via IndexedDB or\n"
+            "  a custom session file — see deep inspection above."
         )
         return "\n".join(lines)
 
@@ -692,8 +801,7 @@ def diagnose() -> str:
     if total_cookies == 0:
         lines.append(
             "\n→ No claude.ai cookies found.\n"
-            "  The 'Local State' search above may show where\n"
-            "  Claude Desktop actually stores its session data."
+            "  See the deep inspection above for alternative auth paths."
         )
         return "\n".join(lines)
 
