@@ -1,13 +1,21 @@
 """
-Read usage data from Claude Desktop's local Chromium session.
+Read claude.ai usage data from a local Chromium-based browser session.
+
+Works with:
+- Claude Desktop (Electron)
+- Google Chrome / Chrome Canary
+- Microsoft Edge
+- Brave Browser
+- Opera / Opera GX
+- Vivaldi
+- Chromium
 
 How it works
 ------------
-1. Find Claude Desktop's Chromium data directory (%APPDATA%\\Claude\\)
-2. Read Local State to get the DPAPI-encrypted AES-256-GCM key
-3. Read the Cookies SQLite file and decrypt the claude.ai session cookies
-4. Call claude.ai's internal API endpoints with those cookies to get
-   the same usage data that Claude Desktop displays
+1. Scan candidate Chromium profile directories
+2. Read Local State → DPAPI-decrypt the AES-256-GCM key (Windows DPAPI)
+3. Copy the Cookies SQLite file to a temp path and decrypt claude.ai cookies
+4. Call claude.ai's internal API endpoints with those cookies
 
 Windows-only (uses Windows DPAPI for cookie key decryption).
 
@@ -17,10 +25,9 @@ Requirements
 
 Limitations
 -----------
-- Requires Claude Desktop to be installed and previously signed in
-- The internal API endpoint may change with Claude Desktop updates
-- Claude Desktop must NOT have an exclusive lock on the Cookies file
-  (usually fine; we copy it to a temp file before reading)
+- The internal API endpoint may change with browser/Claude updates
+- The browser must NOT hold an exclusive lock on the Cookies file
+  (we copy it to a temp file, so this is usually fine)
 """
 from __future__ import annotations
 
@@ -42,50 +49,155 @@ _TIMEOUT = 10
 
 # ── Directory helpers ────────────────────────────────────────────────────────
 
-def _claude_desktop_dirs() -> list[Path]:
-    """Candidate Claude Desktop data directories on Windows."""
-    dirs: list[Path] = []
+def _claude_base_dirs() -> list[Path]:
+    """
+    Return candidate directories where Claude Desktop might store its Electron
+    data.  We try multiple app-name spellings because Electron uses the value
+    of ``app.getName()`` (from package.json) which varies between builds.
+    """
+    candidates: list[Path] = []
     for env in ("APPDATA", "LOCALAPPDATA"):
         base = os.environ.get(env, "")
-        if base:
-            dirs.append(Path(base) / "Claude")
-    return dirs
+        if not base:
+            continue
+        bp = Path(base)
+        for name in (
+            "Claude", "claude",
+            "Claude Desktop", "claude-desktop",
+            "AnthropicClaude", r"Anthropic\Claude",
+        ):
+            candidates.append(bp / name)
+    return candidates
+
+
+def _is_sqlite(path: Path) -> bool:
+    try:
+        with open(path, "rb") as f:
+            return f.read(6) == b"SQLite"
+    except OSError:
+        return False
+
+
+def _find_all_cookies_in_dir(base: Path) -> list[Path]:
+    """
+    Recursively find every SQLite file named 'Cookies' within *base*.
+    Used for Claude Desktop which may store cookies under a Partitions/
+    or session-data/ subdirectory.
+    """
+    found: list[Path] = []
+    try:
+        for p in base.rglob("Cookies"):
+            if p.is_file() and _is_sqlite(p):
+                found.append(p)
+    except (PermissionError, OSError):
+        pass
+    return found
+
+
+def _local_state_for(cookies_path: Path) -> Optional[Path]:
+    """
+    Walk up the directory tree from *cookies_path* looking for Local State.
+    Chromium always places Local State two levels above the Default profile:
+      …/User Data/Local State    (browsers)
+      …/Claude/Local State       (Claude Desktop)
+    but for partitioned sessions it may be further up.
+    """
+    p = cookies_path.parent
+    for _ in range(6):           # don't go too far up
+        candidate = p / "Local State"
+        if candidate.exists():
+            return candidate
+        p = p.parent
+    return None
+
+
+def _candidate_chromium_profiles() -> list[tuple[Path, Path]]:
+    """
+    Return (local_state_path, cookies_path) pairs for every Chromium-based
+    session found on this machine that might hold claude.ai cookies.
+
+    Search order:
+    1. Claude Desktop – recursive scan of all candidate app-data dirs
+    2. Google Chrome, Edge, Brave, Opera, Vivaldi, Chromium – well-known paths
+    """
+    roaming = os.environ.get("APPDATA", "")
+    local   = os.environ.get("LOCALAPPDATA", "")
+
+    results: list[tuple[Path, Path]] = []
+    seen: set[Path] = set()
+
+    def _add(local_state: Optional[Path], cookies: Path) -> None:
+        if cookies in seen:
+            return
+        if local_state and local_state.exists() and cookies.exists() and _is_sqlite(cookies):
+            results.append((local_state, cookies))
+            seen.add(cookies)
+
+    # ── 1. Claude Desktop (recursive) ────────────────────────────────────────
+    for base in _claude_base_dirs():
+        if not base.exists():
+            continue
+        for cookies in _find_all_cookies_in_dir(base):
+            ls = _local_state_for(cookies)
+            _add(ls, cookies)
+
+    # ── 2. Known browser profiles ─────────────────────────────────────────────
+    browser_profiles: list[tuple[str, str]] = [
+        # Google Chrome
+        (local, r"Google\Chrome\User Data\Default"),
+        (local, r"Google\Chrome\User Data\Profile 1"),
+        (local, r"Google\Chrome SxS\User Data\Default"),   # Canary
+        # Microsoft Edge
+        (local, r"Microsoft\Edge\User Data\Default"),
+        (local, r"Microsoft\Edge\User Data\Profile 1"),
+        # Brave
+        (local, r"BraveSoftware\Brave-Browser\User Data\Default"),
+        (local, r"BraveSoftware\Brave-Browser\User Data\Profile 1"),
+        # Opera
+        (roaming, r"Opera Software\Opera Stable"),
+        (roaming, r"Opera Software\Opera GX Stable"),
+        # Vivaldi
+        (local, r"Vivaldi\User Data\Default"),
+        # Chromium
+        (local, r"Chromium\User Data\Default"),
+    ]
+
+    for base_env, sub in browser_profiles:
+        if not base_env:
+            continue
+        profile = Path(base_env) / sub
+        # Local State lives in "User Data" (parent of Default/Profile N)
+        ls = (profile.parent / "Local State") if "\\" in sub else (profile / "Local State")
+        if not ls.exists():
+            ls = profile / "Local State"
+        for cookies_sub in ("Network", ""):
+            c = (profile / cookies_sub / "Cookies") if cookies_sub else (profile / "Cookies")
+            _add(ls, c)
+
+    return results
 
 
 def _find_cookies_file() -> Optional[Path]:
-    """Return the first Cookies file found in any Claude Desktop directory."""
-    for base in _claude_desktop_dirs():
-        for sub in ("Network", ""):
-            p = (base / sub / "Cookies") if sub else (base / "Cookies")
-            if p.exists():
-                return p
+    for _, c in _candidate_chromium_profiles():
+        return c
     return None
 
 
 def _find_local_state() -> Optional[Path]:
-    for base in _claude_desktop_dirs():
-        p = base / "Local State"
-        if p.exists():
-            return p
+    for ls, _ in _candidate_chromium_profiles():
+        return ls
     return None
 
 
 # ── DPAPI + AES key decryption ───────────────────────────────────────────────
 
-def _get_aes_key() -> Optional[bytes]:
+def _get_aes_key_from(local_state_path: Path) -> Optional[bytes]:
     """
-    Read the AES-256-GCM key that Chromium uses to encrypt cookies.
-
-    The key is stored (DPAPI-encrypted) in Local State under
-    os_crypt.encrypted_key (Base64, prefixed with the literal "DPAPI").
+    Read and DPAPI-decrypt the AES-256-GCM key stored in a specific
+    Chromium 'Local State' file.
     """
     if sys.platform != "win32":
         return None
-
-    local_state_path = _find_local_state()
-    if local_state_path is None:
-        return None
-
     try:
         with open(local_state_path, "r", encoding="utf-8") as f:
             state = json.load(f)
@@ -97,8 +209,14 @@ def _get_aes_key() -> Optional[bytes]:
         _, key = win32crypt.CryptUnprotectData(encrypted, None, None, None, 0)
         return key
     except Exception as exc:
-        print(f"[desktop_session] Could not read AES key: {exc}")
+        print(f"[desktop_session] AES key read failed ({local_state_path}): {exc}")
         return None
+
+
+def _get_aes_key() -> Optional[bytes]:
+    """Convenience: get the AES key from the first known profile."""
+    ls = _find_local_state()
+    return _get_aes_key_from(ls) if ls else None
 
 
 def _decrypt_value(encrypted_value: bytes, key: bytes) -> str:
@@ -132,30 +250,19 @@ def _decrypt_value(encrypted_value: bytes, key: bytes) -> str:
 
 # ── Cookie reading ───────────────────────────────────────────────────────────
 
-def get_claude_cookies() -> dict[str, str]:
+def _read_cookies_from(local_state: Path, cookie_path: Path) -> dict[str, str]:
     """
-    Return all cookies for claude.ai and anthropic.com from Claude Desktop.
-
-    Returns an empty dict if:
-    - Not on Windows
-    - Claude Desktop is not installed
-    - Decryption fails
+    Decrypt and return claude.ai / anthropic.com cookies from a specific
+    (local_state, cookies_db) pair.  Returns {} on any error.
     """
-    key = _get_aes_key()
+    key = _get_aes_key_from(local_state)
     if key is None:
         return {}
 
-    cookie_path = _find_cookies_file()
-    if cookie_path is None:
-        return {}
-
-    # Copy DB to a temp file so we don't conflict with Claude Desktop's lock
     tmp_fd, tmp_path = tempfile.mkstemp(suffix=".db")
     os.close(tmp_fd)
-
     try:
         shutil.copy2(str(cookie_path), tmp_path)
-        # Copy WAL and SHM files if they exist (needed for consistency)
         for ext in ("-wal", "-shm"):
             src = Path(str(cookie_path) + ext)
             if src.exists():
@@ -178,11 +285,10 @@ def get_claude_cookies() -> dict[str, str]:
                     result[row["name"]] = val
             except Exception:
                 pass
-
         return result
 
     except Exception as exc:
-        print(f"[desktop_session] Cookie read error: {exc}")
+        print(f"[desktop_session] Cookie read error ({cookie_path}): {exc}")
         return {}
     finally:
         for suffix in ("", "-wal", "-shm"):
@@ -190,6 +296,21 @@ def get_claude_cookies() -> dict[str, str]:
                 os.unlink(tmp_path + suffix)
             except OSError:
                 pass
+
+
+def get_claude_cookies() -> dict[str, str]:
+    """
+    Try every known Chromium profile in order and return the first set of
+    claude.ai / anthropic.com cookies found.
+    """
+    if sys.platform != "win32":
+        return {}
+
+    for local_state, cookies_path in _candidate_chromium_profiles():
+        result = _read_cookies_from(local_state, cookies_path)
+        if result:
+            return result
+    return {}
 
 
 # ── Usage fetching ───────────────────────────────────────────────────────────
@@ -433,43 +554,79 @@ def is_available() -> bool:
 
 
 def diagnose() -> str:
-    """Return a human-readable diagnostic string."""
-    lines = []
+    """Return a human-readable diagnostic string for the Settings window."""
+    lines: list[str] = []
 
-    dirs = _claude_desktop_dirs()
-    lines.append(f"Claude Desktop candidate dirs: {[str(d) for d in dirs]}")
+    # ── 1. Claude Desktop base directories ───────────────────────────────────
+    claude_dirs = _claude_base_dirs()
+    existing_claude = [d for d in claude_dirs if d.exists()]
+    lines.append("Claude Desktop candidate dirs checked:")
+    for d in claude_dirs:
+        lines.append(f"  {'[OK]' if d.exists() else '[  ]'} {d}")
 
-    cookie_file = _find_cookies_file()
-    lines.append(f"Cookies file: {cookie_file or 'NOT FOUND'}")
+    if existing_claude:
+        lines.append("\nContents of existing Claude dirs:")
+        for d in existing_claude:
+            try:
+                children = sorted(d.iterdir())[:20]
+                for c in children:
+                    lines.append(f"  {d.name}\\{c.name}{'\\' if c.is_dir() else ''}")
+                if len(list(d.iterdir())) > 20:
+                    lines.append(f"  … (truncated)")
+            except PermissionError:
+                lines.append(f"  (permission denied)")
 
-    local_state = _find_local_state()
-    lines.append(f"Local State:  {local_state or 'NOT FOUND'}")
+    # ── 2. All Chromium profiles found ────────────────────────────────────────
+    profiles = _candidate_chromium_profiles()
+    lines.append(f"\nChromium profiles with Cookies + Local State: {len(profiles)}")
+    for ls, c in profiles:
+        lines.append(f"  Local State: {ls}")
+        lines.append(f"  Cookies:     {c}")
 
-    if not cookie_file or not local_state:
-        lines.append("\n→ Claude Desktop does not appear to be installed.")
+    if not profiles:
+        lines.append(
+            "\n→ No Chromium session found.\n"
+            "  Make sure you are signed in to claude.ai in Chrome / Edge / Brave,\n"
+            "  or have Claude Desktop installed and signed in."
+        )
         return "\n".join(lines)
 
-    key = _get_aes_key()
-    lines.append(f"AES key read: {'OK' if key else 'FAILED (pywin32 installed?)'}")
+    # ── 3. Cookie decryption ──────────────────────────────────────────────────
+    total_cookies = 0
+    cookie_names: list[str] = []
+    for ls, c in profiles:
+        key = _get_aes_key_from(ls)
+        if key is None:
+            lines.append(f"\nAES key: FAILED for {ls.parent.name} (pywin32 installed?)")
+            continue
+        cookies = _read_cookies_from(ls, c)
+        lines.append(f"\nProfile {c.parent.parent.name}\\{c.parent.name}\\{c.name}:")
+        lines.append(f"  AES key: OK")
+        lines.append(f"  claude.ai cookies: {len(cookies)}"
+                     + (f" ({', '.join(list(cookies)[:5])})" if cookies else ""))
+        total_cookies += len(cookies)
+        cookie_names.extend(cookies.keys())
 
-    cookies = get_claude_cookies()
-    lines.append(f"Cookies found: {len(cookies)} ({', '.join(list(cookies)[:5])}{'…' if len(cookies) > 5 else ''})")
-
-    if not cookies:
-        lines.append("\n→ No cookies found. Are you signed in to Claude Desktop?")
+    if total_cookies == 0:
+        lines.append(
+            "\n→ No claude.ai cookies found in any profile.\n"
+            "  Please sign in to claude.ai in your browser and try again."
+        )
         return "\n".join(lines)
 
-    lines.append("\nTrying API endpoints…")
+    # ── 4. API call ───────────────────────────────────────────────────────────
+    lines.append("\nTrying claude.ai API endpoints…")
     result = fetch_usage()
     if result["error"]:
         lines.append(f"Error: {result['error']}")
     else:
-        lines.append(f"pct_5h = {result['pct_5h']}")
-        lines.append(f"pct_7d = {result['pct_7d']}")
+        lines.append(f"✓ pct_5h = {result['pct_5h']}")
+        lines.append(f"✓ pct_7d = {result['pct_7d']}")
 
     if result.get("_raw"):
-        lines.append("\nRaw responses:")
+        lines.append("\nRaw API responses:")
         for url, data in result["_raw"].items():
-            lines.append(f"  {url}: {str(data)[:120]}")
+            lines.append(f"  {url}:")
+            lines.append(f"    {str(data)[:200]}")
 
     return "\n".join(lines)
