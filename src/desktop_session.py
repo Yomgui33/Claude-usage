@@ -997,6 +997,235 @@ def _headers_for_oauth(token_cache: dict) -> dict:
     return headers
 
 
+# ---------------------------------------------------------------------------
+# Webview-based login (the correct approach for Windows MSIX)
+# ---------------------------------------------------------------------------
+
+_CREDENTIAL_TARGET = "ClaudeUsageMonitor/sessionKey"
+
+
+def save_session_key(session_key: str) -> None:
+    """Persist the claude.ai sessionKey in Windows Credential Manager."""
+    try:
+        import win32cred  # type: ignore
+        win32cred.CredWrite({
+            "Type": win32cred.CRED_TYPE_GENERIC,
+            "TargetName": _CREDENTIAL_TARGET,
+            "UserName": "claude.ai",
+            "CredentialBlob": session_key,
+            "Persist": win32cred.CRED_PERSIST_LOCAL_MACHINE,
+        })
+    except Exception as exc:
+        print(f"[desktop_session] Could not save session key: {exc}")
+
+
+def load_session_key() -> Optional[str]:
+    """Load the stored claude.ai sessionKey from Windows Credential Manager."""
+    try:
+        import win32cred  # type: ignore
+        cred = win32cred.CredRead(_CREDENTIAL_TARGET, win32cred.CRED_TYPE_GENERIC)
+        blob = cred.get("CredentialBlob")
+        if blob:
+            return blob if isinstance(blob, str) else blob.decode()
+    except Exception:
+        pass
+    return None
+
+
+def delete_session_key() -> None:
+    """Remove the stored sessionKey (logout)."""
+    try:
+        import win32cred  # type: ignore
+        win32cred.CredDelete(_CREDENTIAL_TARGET, win32cred.CRED_TYPE_GENERIC)
+    except Exception:
+        pass
+
+
+def _org_id_from_oauth(oauth: Optional[dict]) -> Optional[str]:
+    """Extract the organization UUID from the oauth:tokenCache dict."""
+    if not oauth:
+        return None
+    for key in oauth:
+        parts = str(key).split(":")
+        if len(parts) >= 2 and len(parts[1]) == 36:
+            return parts[1]
+    return None
+
+
+def _try_session_key(session_key: str, org_id: str) -> Optional[dict]:
+    """
+    Call https://claude.ai/api/organizations/{org_id}/usage using a
+    sessionKey cookie (the same auth method as claude-usage-widget).
+    Returns a parsed usage dict or None on failure.
+    """
+    headers = {
+        "Cookie": f"sessionKey={session_key}",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/144.0.7559.173 Safari/537.36"
+        ),
+        "Accept": "application/json",
+        "Referer": "https://claude.ai/",
+    }
+    urls = [
+        f"https://claude.ai/api/organizations/{org_id}/usage",
+        f"https://claude.ai/api/organizations/{org_id}/overage_spend_limit",
+        f"https://claude.ai/api/organizations/{org_id}/prepaid/credits",
+    ]
+    merged: dict = {}
+    for url in urls:
+        try:
+            try:
+                resp = requests.get(url, headers=headers, timeout=_TIMEOUT)
+            except requests.exceptions.SSLError:
+                import urllib3  # type: ignore
+                urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+                resp = requests.get(url, headers=headers, timeout=_TIMEOUT, verify=False)
+            if resp.ok:
+                try:
+                    merged.update(resp.json())
+                except ValueError:
+                    pass
+        except requests.RequestException:
+            pass
+
+    usage = _extract_usage(merged)
+    if usage:
+        usage["error"] = None
+        usage["_raw"] = {"sessionKey": merged}
+        return usage
+    return None
+
+
+def fetch_usage_via_webview(org_id: str) -> dict:
+    """
+    Open a pywebview browser window for the user to sign in to claude.ai,
+    then fetch usage data by running a fetch() call inside the browser
+    context (where the session cookie is automatically available).
+
+    This replicates the approach used by the Electron-based claude-usage-widget:
+    the browser window has the session cookies, so API calls made from
+    JavaScript within it succeed — no cookie extraction needed.
+
+    Returns the same dict shape as fetch_usage().
+    """
+    import threading
+    import json as _json
+
+    empty: dict = {
+        "pct_5h": None, "pct_7d": None,
+        "reset_5h": None, "reset_7d": None,
+        "error": None, "_raw": {},
+    }
+
+    try:
+        import webview  # type: ignore
+    except ImportError:
+        empty["error"] = (
+            "pywebview is not installed.\n"
+            "Run: pip install pywebview"
+        )
+        return empty
+
+    result: dict = {}
+    done = threading.Event()
+
+    usage_url    = f"https://claude.ai/api/organizations/{org_id}/usage"
+    overage_url  = f"https://claude.ai/api/organizations/{org_id}/overage_spend_limit"
+    prepaid_url  = f"https://claude.ai/api/organizations/{org_id}/prepaid/credits"
+
+    # JavaScript that fetches all three endpoints and returns a combined JSON.
+    FETCH_JS = f"""
+    (function() {{
+        var urls = [
+            '{usage_url}',
+            '{overage_url}',
+            '{prepaid_url}'
+        ];
+        return Promise.allSettled(urls.map(function(u) {{
+            return fetch(u, {{headers: {{'Accept': 'application/json'}}}})
+                   .then(function(r) {{ return r.ok ? r.json() : null; }})
+                   .catch(function() {{ return null; }});
+        }})).then(function(results) {{
+            return JSON.stringify(results.map(function(r) {{
+                return r.status === 'fulfilled' ? r.value : null;
+            }}));
+        }});
+    }})()
+    """
+
+    DETECT_LOGGED_IN_JS = """
+    (function() {
+        /* Logged in if not on login/home page and user menu exists */
+        var url = window.location.href;
+        return !url.includes('/login') && !url.endsWith('claude.ai/') && !url.endsWith('claude.ai');
+    })()
+    """
+
+    def _poll_and_fetch(window):
+        """Background thread: wait for login, then fetch usage."""
+        import time
+        for _ in range(600):   # up to 10 minutes
+            time.sleep(1)
+            try:
+                logged_in = window.evaluate_js(DETECT_LOGGED_IN_JS)
+                if logged_in:
+                    break
+            except Exception:
+                continue
+
+        # Give the page a moment to settle
+        time.sleep(2)
+
+        try:
+            raw = window.evaluate_js(FETCH_JS)
+            if raw:
+                payloads = _json.loads(raw)
+                # Merge all non-None payloads into one dict
+                merged: dict = {}
+                for p in payloads:
+                    if isinstance(p, dict):
+                        merged.update(p)
+                result["raw"] = merged
+        except Exception as exc:
+            result["error"] = str(exc)
+        finally:
+            done.set()
+            try:
+                window.destroy()
+            except Exception:
+                pass
+
+    window = webview.create_window(
+        "Sign in to Claude — Usage Monitor",
+        "https://claude.ai/login",
+        width=1050,
+        height=750,
+    )
+    webview.start(_poll_and_fetch, window, private_mode=False)
+    done.wait(timeout=630)
+
+    raw_data = result.get("raw", {})
+    empty["_raw"] = {"webview": raw_data}
+
+    if result.get("error"):
+        empty["error"] = result["error"]
+        return empty
+
+    usage = _extract_usage(raw_data)
+    if usage:
+        usage["error"] = None
+        usage["_raw"] = {"webview": raw_data}
+        return usage
+
+    empty["error"] = (
+        "Webview login succeeded but no usage data found in the API response.\n"
+        f"Raw response: {str(raw_data)[:300]}"
+    )
+    return empty
+
+
 def fetch_usage() -> dict:
     """
     Read Claude Desktop session cookies (or OAuth token) and call
@@ -1022,13 +1251,23 @@ def fetch_usage() -> dict:
         empty["error"] = "Desktop session reading is only supported on Windows."
         return empty
 
+    # 1. Try a sessionKey stored from a previous webview login.
+    stored_key = load_session_key()
+    if stored_key:
+        org_id = _org_id_from_oauth(get_oauth_token())
+        if org_id:
+            result = _try_session_key(stored_key, org_id)
+            if result and not result.get("error"):
+                return result
+            # Key may be expired — fall through
+
     cookies = get_claude_cookies()
     oauth   = get_oauth_token() if not cookies else None
 
     if not cookies and not oauth:
         empty["error"] = (
-            "No Claude Desktop session found. "
-            "Make sure you are signed in to Claude Desktop."
+            "No Claude Desktop session found.\n"
+            "Use Settings → Connect to Claude to sign in."
         )
         return empty
 

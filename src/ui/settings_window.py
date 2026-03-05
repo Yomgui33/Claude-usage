@@ -112,6 +112,38 @@ class SettingsWindow:
             relief="flat", bg="#dddddd",
         ).pack(side="left", padx=(4, 0))
 
+        # ── Claude Desktop – webview login ────────────────────────────
+        if __import__("sys").platform == "win32":
+            self._add_section(
+                win,
+                "Claude Desktop — Connect",
+                tip=(
+                    "Opens a browser window to sign in to claude.ai.\n"
+                    "The session key is stored securely in Windows Credential Manager\n"
+                    "and used to fetch your usage from Claude's API."
+                ),
+            )
+            conn_row = tk.Frame(win, bg=BG)
+            conn_row.pack(fill="x", padx=pad, pady=(0, 8))
+
+            self._lbl_conn_status = tk.Label(
+                conn_row, text=self._conn_status_text(),
+                bg=BG, fg=HINT, font=("", 9),
+            )
+            self._lbl_conn_status.pack(side="left", padx=(0, 8))
+
+            tk.Button(
+                conn_row, text="Sign in to Claude…",
+                relief="flat", bg="#4a90d9", fg="white",
+                command=self._do_webview_login,
+            ).pack(side="left", padx=(0, 4))
+
+            tk.Button(
+                conn_row, text="Sign out",
+                relief="flat", bg="#dddddd", fg=TEXT,
+                command=self._do_webview_logout,
+            ).pack(side="left")
+
         # Diagnostics buttons
         diag_row = tk.Frame(win, bg=BG)
         diag_row.pack(fill="x", padx=pad, pady=(0, 8))
@@ -246,6 +278,56 @@ class SettingsWindow:
             result["message"],
             parent=self._win,
         )
+
+    def _conn_status_text(self) -> str:
+        try:
+            from ..desktop_session import load_session_key
+            key = load_session_key()
+            return "● Connected" if key else "○ Not connected"
+        except Exception:
+            return ""
+
+    def _do_webview_login(self) -> None:
+        """Open webview login and fetch usage once logged in."""
+        import threading
+        from ..desktop_session import (
+            fetch_usage_via_webview, save_session_key,
+            get_oauth_token, _org_id_from_oauth,
+        )
+
+        oauth = get_oauth_token()
+        org_id = _org_id_from_oauth(oauth) if oauth else None
+
+        if not org_id:
+            messagebox.showerror(
+                "No org ID",
+                "Could not determine your organization ID from Claude Desktop.\n"
+                "Make sure Claude Desktop is installed and you have signed in.",
+                parent=self._win,
+            )
+            return
+
+        self._lbl_conn_status.config(text="⏳ Opening browser…")
+        self._win.update_idletasks()
+
+        def _run():
+            result = fetch_usage_via_webview(org_id)
+            # If the webview made the call successfully, we can also extract
+            # sessionKey via JS — but fetch_usage_via_webview handles auth
+            # internally.  Just update the status label.
+            if result and not result.get("error"):
+                self._lbl_conn_status.config(text="● Connected")
+            else:
+                err = (result or {}).get("error", "Unknown error")
+                self._lbl_conn_status.config(text="✗ Failed")
+                messagebox.showerror("Login failed", str(err), parent=self._win)
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _do_webview_logout(self) -> None:
+        from ..desktop_session import delete_session_key
+        delete_session_key()
+        self._lbl_conn_status.config(text="○ Not connected")
 
     def _run_desktop_diagnostics(self) -> None:
         import os, subprocess, tempfile

@@ -5,3 +5,4 @@ requests>=2.31.0
 # Windows-only: required for Claude Desktop session reading
 pywin32>=306; sys_platform == "win32"
 pycryptodome>=3.19.0; sys_platform == "win32"
+pywebview>=4.4.1; sys_platform == 'win32'
