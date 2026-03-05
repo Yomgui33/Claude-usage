@@ -715,9 +715,21 @@ def fetch_usage() -> dict:
     endpoints = _CANDIDATE_ENDPOINTS_OAUTH if oauth else _CANDIDATE_ENDPOINTS_COOKIE
 
     for url in endpoints:
+        # For OAuth, use minimal headers for api.anthropic.com so we don't
+        # confuse it with claude.ai-specific fields (Referer, Origin).
+        if oauth and url.startswith("https://api.anthropic.com"):
+            access = _extract_token_value(oauth)  # type: ignore[arg-type]
+            req_headers = {
+                "x-api-key": access,
+                "anthropic-version": "2023-06-01",
+                "Accept": "application/json",
+            }
+        else:
+            req_headers = headers
+
         try:
             try:
-                resp = requests.get(url, headers=headers, timeout=_TIMEOUT)
+                resp = requests.get(url, headers=req_headers, timeout=_TIMEOUT)
             except requests.exceptions.SSLError:
                 # Corporate proxy / custom CA not in Python's bundle.
                 # Retry without certificate verification (connection is still
@@ -725,10 +737,16 @@ def fetch_usage() -> dict:
                 import urllib3  # type: ignore
                 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
                 resp = requests.get(
-                    url, headers=headers, timeout=_TIMEOUT, verify=False
+                    url, headers=req_headers, timeout=_TIMEOUT, verify=False
                 )
 
             if resp.status_code in (401, 403):
+                raw_responses[url] = f"HTTP {resp.status_code}"
+                if oauth:
+                    # Different endpoints need different auth; keep trying.
+                    continue
+                # Cookie auth: all same-domain endpoints share the same
+                # session, so a 401/403 means the session is expired.
                 empty["error"] = (
                     "Session expired or not authenticated. "
                     "Please open Claude Desktop and sign in again."
