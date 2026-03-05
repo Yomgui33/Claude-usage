@@ -570,16 +570,56 @@ def _extract_usage(data: object, depth: int = 0) -> Optional[dict]:
     return None
 
 
+def _get_nextjs_build_id(html: str) -> Optional[str]:
+    """Extract the Next.js build ID from a claude.ai HTML page."""
+    import re as _re
+    m = _re.search(r'data-build-id=["\']([a-f0-9]+)["\']', html)
+    if m:
+        return m.group(1)
+    # Fallback: __NEXT_DATA__ build ID field
+    m2 = _re.search(r'"buildId"\s*:\s*"([a-f0-9]+)"', html)
+    if m2:
+        return m2.group(1)
+    return None
+
+
+def _fetch_nextjs_data(build_id: str, page_path: str, headers: dict) -> Optional[dict]:
+    """
+    Fetch Next.js server-side data for a page via:
+      GET /_next/data/{build_id}/{page_path}.json
+
+    Returns the parsed JSON or None.
+    """
+    import json as _json
+
+    url = f"https://claude.ai/_next/data/{build_id}/{page_path}.json"
+    req_headers = {
+        **headers,
+        "Accept": "application/json, */*;q=0.8",
+    }
+    try:
+        try:
+            resp = requests.get(url, headers=req_headers, timeout=_TIMEOUT)
+        except requests.exceptions.SSLError:
+            import urllib3  # type: ignore
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+            resp = requests.get(url, headers=req_headers, timeout=_TIMEOUT, verify=False)
+        if resp.ok:
+            return resp.json()
+        return None
+    except Exception:
+        return None
+
+
 def _scrape_usage_page(headers: dict) -> Optional[dict]:
     """
     Attempt to scrape https://claude.ai/settings/usage as an HTML page.
 
-    If the page is SSR-rendered (Next.js), the usage data is embedded in a
-    <script id="__NEXT_DATA__"> JSON blob.  We parse that blob and run it
-    through _extract_usage().
-
-    Works only if the provided headers include a valid session cookie or a
-    Bearer token that the claude.ai SSR layer accepts.
+    Strategy:
+    1. Fetch the HTML page.
+    2. Extract the Next.js build ID from data-build-id attribute.
+    3. Probe /_next/data/{build_id}/settings/usage.json for SSR page data.
+    4. Fall back to __NEXT_DATA__ blob or inline JSON in the HTML.
     """
     import re as _re
 
@@ -614,7 +654,22 @@ def _scrape_usage_page(headers: dict) -> Optional[dict]:
 
     html = resp.text
 
-    # 1. __NEXT_DATA__ blob (SSR data)
+    # 1. Next.js data endpoint — /_next/data/{build_id}/settings/usage.json
+    #    This is how the Next.js client fetches SSR page props; it may return
+    #    usage data even when __NEXT_DATA__ is absent from the HTML shell.
+    build_id = _get_nextjs_build_id(html)
+    if build_id:
+        for page_path in ("settings/usage", "en/settings/usage", "fr/settings/usage"):
+            data = _fetch_nextjs_data(build_id, page_path, {
+                **headers,
+                "Accept": "application/json",
+            })
+            if data:
+                usage = _extract_usage(data)
+                if usage:
+                    return usage
+
+    # 2. __NEXT_DATA__ blob (SSR data embedded in the HTML)
     m = _re.search(r'<script[^>]+id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>', html, _re.S)
     if m:
         try:
@@ -626,7 +681,7 @@ def _scrape_usage_page(headers: dict) -> Optional[dict]:
         except Exception:
             pass
 
-    # 2. Inline JSON objects anywhere in the page
+    # 3. Inline JSON objects anywhere in the page
     for candidate in _re.findall(r'\{[^{}]{20,}(?:pct|usage|remaining|limit)[^{}]{0,200}\}', html):
         try:
             import json as _json
@@ -1510,6 +1565,41 @@ def _diagnose_alt_auth(userdata_dirs: list[Path]) -> list[str]:
                 # Show first 500 chars to see if it's a login redirect
                 snippet = body[:500].replace("\n", " ").strip()
                 lines.append(f"  No __NEXT_DATA__. Body[:500]: {snippet}")
+
+            # Probe /_next/data/{build_id}/settings/usage.json
+            build_id = _get_nextjs_build_id(body)
+            lines.append(f"  data-build-id: {build_id or '(not found)'}")
+            if build_id:
+                for page_path in ("settings/usage", "en/settings/usage"):
+                    nj_url = f"https://claude.ai/_next/data/{build_id}/{page_path}.json"
+                    try:
+                        try:
+                            nj = requests.get(nj_url, headers={
+                                **scrape_hdrs,
+                                "Accept": "application/json",
+                            }, timeout=_TIMEOUT)
+                        except requests.exceptions.SSLError:
+                            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+                            nj = requests.get(nj_url, headers={
+                                **scrape_hdrs,
+                                "Accept": "application/json",
+                            }, timeout=_TIMEOUT, verify=False)
+                        lines.append(f"  /_next/data/.../settings/usage.json → HTTP {nj.status_code}")
+                        if nj.ok:
+                            try:
+                                import json as _j2
+                                nj_data = nj.json()
+                                lines.append(f"    keys: {list(nj_data.keys())[:10]}")
+                                lines.append(f"    snippet: {str(nj_data)[:400]}")
+                            except Exception:
+                                lines.append(f"    body: {nj.text[:300]}")
+                        else:
+                            try:
+                                lines.append(f"    error: {nj.json()}")
+                            except Exception:
+                                lines.append(f"    body: {nj.text[:200]}")
+                    except requests.RequestException as exc2:
+                        lines.append(f"  /_next/data → {exc2}")
         except requests.RequestException as exc:
             lines.append(f"  Request failed: {exc}")
     else:
