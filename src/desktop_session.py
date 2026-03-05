@@ -136,19 +136,29 @@ def _is_sqlite(path: Path) -> bool:
         return False
 
 
-def _find_all_cookies_in_dir(base: Path) -> list[Path]:
+def _find_all_cookies_in_dir(base: Path, _depth: int = 0) -> list[Path]:
     """
     Recursively find every SQLite file named 'Cookies' within *base*.
-    Used for Claude Desktop which may store cookies under a Partitions/
-    or session-data/ subdirectory.
+
+    Uses a manual traversal (not rglob) so that a single inaccessible
+    entry (e.g. a broken symlink that raises WinError 1920) does not
+    abort the entire search.
     """
+    if _depth > 8:
+        return []
     found: list[Path] = []
     try:
-        for p in base.rglob("Cookies"):
-            if p.is_file() and _is_sqlite(p):
-                found.append(p)
-    except (PermissionError, OSError):
-        pass
+        entries = list(base.iterdir())
+    except OSError:
+        return found
+    for entry in entries:
+        try:
+            if entry.name == "Cookies" and entry.is_file() and _is_sqlite(entry):
+                found.append(entry)
+            elif entry.is_dir():
+                found.extend(_find_all_cookies_in_dir(entry, _depth + 1))
+        except OSError:
+            continue
     return found
 
 
