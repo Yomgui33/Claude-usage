@@ -792,8 +792,10 @@ def fetch_usage() -> dict:
         # confuse it with claude.ai-specific fields (Referer, Origin).
         if oauth and url.startswith("https://api.anthropic.com"):
             access = _extract_token_value(oauth)  # type: ignore[arg-type]
+            # Claude Desktop uses OAuth Bearer auth with api.anthropic.com,
+            # NOT the x-api-key header (that's for static API keys only).
             req_headers = {
-                "x-api-key": access,
+                "Authorization": f"Bearer {access}",
                 "anthropic-version": "2023-06-01",
                 "Accept": "application/json",
             }
@@ -1133,6 +1135,14 @@ def _diagnose_alt_auth(userdata_dirs: list[Path]) -> list[str]:
             if len(v_str) > 20:
                 v_str = v_str[:10] + "…" + v_str[-6:]
             lines.append(f"    {k}: {v_str}")
+            # If the value is itself a dict (namespaced token cache format),
+            # show its keys and redacted values so we know what fields exist.
+            if isinstance(v, dict):
+                for ik, iv in v.items():
+                    iv_str = str(iv)
+                    if len(iv_str) > 20:
+                        iv_str = iv_str[:6] + "…" + iv_str[-5:]
+                    lines.append(f"      .{ik}: {iv_str}")
         # Attempt API call using the token
         lines.append("\n  Attempting API call with OAuth token…")
         result = fetch_usage()
