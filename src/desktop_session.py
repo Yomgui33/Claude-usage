@@ -800,12 +800,11 @@ def fetch_usage() -> dict:
                 if len(parts) >= 2 and len(parts[1]) == 36:
                     workspace_id = parts[1]
                     break
-            # Try all auth styles Claude Desktop may use:
-            # - x-api-key (static API keys, sk-ant-api03-...)
-            # - Authorization: Bearer (OAuth tokens, sk-ant-ocp04-...)
-            # anthropic-account-id scopes the token to the right workspace.
+            # Claude Desktop OAuth tokens (sk-ant-ocp04-...) use
+            # Authorization: Bearer — NOT x-api-key (static API keys only).
+            # Sending both causes Anthropic to process x-api-key first and
+            # return "invalid x-api-key".
             req_headers = {
-                "x-api-key": access,
                 "Authorization": f"Bearer {access}",
                 "anthropic-version": "2023-06-01",
                 "Accept": "application/json",
