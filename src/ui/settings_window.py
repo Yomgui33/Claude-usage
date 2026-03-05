@@ -248,11 +248,20 @@ class SettingsWindow:
         )
 
     def _run_desktop_diagnostics(self) -> None:
+        import os, subprocess, tempfile
         from ..desktop_session import diagnose as desktop_diagnose
         msg = desktop_diagnose()
+        # Write to a temp file and open it in Notepad
+        tmp = os.path.join(tempfile.gettempdir(), "claude_desktop_diag.txt")
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(msg)
+        try:
+            subprocess.Popen(["notepad.exe", tmp])
+        except Exception:
+            pass
         messagebox.showinfo(
             "Claude Desktop Session Diagnostics",
-            msg,
+            f"Diagnostic saved to:\n{tmp}\n\nNotepad should open automatically.",
             parent=self._win,
         )
 
