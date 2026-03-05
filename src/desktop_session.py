@@ -778,21 +778,26 @@ def _extract_user_traits_from_leveldb(ldb_dir: Path) -> dict:
         if idx == -1:
             continue
 
-        # The value follows the key in LevelDB; scan forward for the JSON object
-        window = data[idx: idx + 2000]
+        # The value follows the key in LevelDB; use a generous window since
+        # the traits object can be several KB (many Segment.io fields).
+        window = data[idx: idx + 8000]
         try:
             text = window.decode("utf-8", errors="replace")
         except Exception:
             continue
 
-        # Find the first '{' after the key
-        j = text.find("{")
+        # Strip binary framing before trying to find the JSON object.
+        # LevelDB keys are length-prefixed; the payload starts with '"{'
+        # or just '{' somewhere within the first ~200 chars of the window.
+        text_clean = _re.sub(r"[\x00-\x08\x0b-\x0c\x0e-\x1f\x7f-\x9f\ufffd]", " ", text)
+
+        j = text_clean.find("{")
         if j == -1:
             continue
-        # Find matching closing brace
+        # Walk forward to find the matching closing brace
         depth = 0
         end = j
-        for i, ch in enumerate(text[j:], j):
+        for i, ch in enumerate(text_clean[j:], j):
             if ch == "{":
                 depth += 1
             elif ch == "}":
@@ -800,14 +805,26 @@ def _extract_user_traits_from_leveldb(ldb_dir: Path) -> dict:
                 if depth == 0:
                     end = i
                     break
-        json_str = text[j: end + 1]
-        # Remove replacement characters from binary framing
-        json_str = _re.sub(r"[\x00-\x1f\x7f-\x9f\ufffd]", " ", json_str)
+
+        json_str = text_clean[j: end + 1]
         try:
             traits = _json.loads(json_str)
             if isinstance(traits, dict) and ("org_type" in traits or "email" in traits):
                 return traits
         except Exception:
+            # JSON parse failed — try extracting individual fields with regex
+            out: dict = {}
+            for field in ("email", "org_type", "billing_type", "subscription_plan",
+                          "plan", "organization_uuid", "account_created_at"):
+                m = _re.search(rf'"{field}"\s*:\s*"([^"]*)"', json_str)
+                if m:
+                    out[field] = m.group(1)
+                else:
+                    m2 = _re.search(rf'"{field}"\s*:\s*(\d+)', json_str)
+                    if m2:
+                        out[field] = int(m2.group(1))
+            if out.get("org_type") or out.get("email"):
+                return out
             pass
 
     return {}
@@ -1439,6 +1456,64 @@ def _diagnose_alt_auth(userdata_dirs: list[Path]) -> list[str]:
                 lines.append(f"    {s[:300]}")
         else:
             lines.append("  (no usage/rate-limit strings found)")
+
+    # ── G. Scrape claude.ai/settings/usage ───────────────────────────────────
+    lines.append("\n=== G. Scrape claude.ai/settings/usage ===")
+    token_obj = get_oauth_token()
+    if token_obj:
+        access = _extract_token_value(token_obj)
+        scrape_hdrs = {
+            "Authorization": f"Bearer {access}",
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/144.0.7559.173 Electron/40.4.1 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
+            "Referer": "https://claude.ai/",
+        }
+        try:
+            try:
+                r = requests.get("https://claude.ai/settings/usage",
+                                 headers=scrape_hdrs, timeout=_TIMEOUT,
+                                 allow_redirects=True)
+            except requests.exceptions.SSLError:
+                import urllib3  # type: ignore
+                urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+                r = requests.get("https://claude.ai/settings/usage",
+                                 headers=scrape_hdrs, timeout=_TIMEOUT,
+                                 allow_redirects=True, verify=False)
+            lines.append(f"  HTTP {r.status_code}  final_url: {r.url}")
+            lines.append(f"  Content-Type: {r.headers.get('Content-Type', '?')}")
+            body = r.text
+            # Show whether __NEXT_DATA__ is present
+            if "__NEXT_DATA__" in body:
+                import re as _re2, json as _json2
+                m = _re2.search(
+                    r'<script[^>]+id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>',
+                    body, _re2.S)
+                if m:
+                    try:
+                        blob = _json2.loads(m.group(1))
+                        lines.append(f"  __NEXT_DATA__ keys: {list(blob.keys())[:10]}")
+                        # Show props.pageProps keys if present
+                        pp = blob.get("props", {}).get("pageProps", {})
+                        if pp:
+                            lines.append(f"  pageProps keys: {list(pp.keys())[:15]}")
+                            lines.append(f"  pageProps snippet: {str(pp)[:400]}")
+                    except Exception as exc:
+                        lines.append(f"  __NEXT_DATA__ parse error: {exc}")
+                else:
+                    lines.append("  __NEXT_DATA__ present but no <script> tag matched")
+            else:
+                # Show first 500 chars to see if it's a login redirect
+                snippet = body[:500].replace("\n", " ").strip()
+                lines.append(f"  No __NEXT_DATA__. Body[:500]: {snippet}")
+        except requests.RequestException as exc:
+            lines.append(f"  Request failed: {exc}")
+    else:
+        lines.append("  (no OAuth token available)")
 
     return lines
 
