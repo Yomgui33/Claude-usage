@@ -533,10 +533,111 @@ def _extract_usage(data: object, depth: int = 0) -> Optional[dict]:
     return None
 
 
+def _get_claude_desktop_userdata_dirs() -> list[Path]:
+    """
+    Return directories that look like Claude Desktop Electron userData
+    (have 'Local State' + 'config.json' and typical Chromium sub-dirs).
+    """
+    result: list[Path] = []
+    for d in _claude_base_dirs():
+        if not d.exists():
+            continue
+        try:
+            children = {c.name.lower() for c in d.iterdir()}
+        except OSError:
+            continue
+        if "local state" in children and "config.json" in children:
+            if any(k in children for k in ("network", "indexeddb", "local storage",
+                                            "ant-did", "claude_desktop_config.json")):
+                result.append(d)
+    return result
+
+
+def get_oauth_token() -> Optional[dict]:
+    """
+    Read and decrypt Claude Desktop's OAuth token from config.json.
+
+    The value at key 'oauth:tokenCache' is a base64-encoded, v10-prefixed
+    AES-256-GCM blob — the same format as Chromium cookie values.
+    The AES key comes from 'Local State' in the same directory.
+
+    Returns the decrypted token as a dict, or None on failure.
+    """
+    if sys.platform != "win32":
+        return None
+
+    for userdata in _get_claude_desktop_userdata_dirs():
+        config_path      = userdata / "config.json"
+        local_state_path = userdata / "Local State"
+
+        if not config_path.exists() or not local_state_path.exists():
+            continue
+
+        key = _get_aes_key_from(local_state_path)
+        if key is None:
+            continue
+
+        try:
+            config = json.loads(config_path.read_bytes())
+            encrypted_b64 = config.get("oauth:tokenCache")
+            if not encrypted_b64:
+                continue
+
+            encrypted = base64.b64decode(encrypted_b64)
+            decrypted = _decrypt_value(encrypted, key)
+            token = json.loads(decrypted)
+            if isinstance(token, dict):
+                return token
+        except Exception as exc:
+            print(f"[desktop_session] OAuth token decryption failed: {exc}")
+            continue
+
+    return None
+
+
+def _headers_for_oauth(token: dict) -> dict:
+    """
+    Build HTTP headers for claude.ai using a decrypted OAuth token dict.
+    Tries common key names for access tokens and session tokens.
+    """
+    headers: dict[str, str] = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/json, text/plain, */*",
+        "Referer": "https://claude.ai/",
+        "Origin": "https://claude.ai",
+    }
+
+    # Bearer token (Anthropic API / oauth flow)
+    access = (
+        token.get("access_token")
+        or token.get("accessToken")
+        or token.get("token")
+        or ""
+    )
+    if access:
+        headers["Authorization"] = f"Bearer {access}"
+
+    # Session cookie equivalent
+    session = (
+        token.get("session_token")
+        or token.get("sessionToken")
+        or token.get("__Secure-next-auth.session-token")
+        or ""
+    )
+    if session:
+        headers["Cookie"] = f"__Secure-next-auth.session-token={session}"
+
+    return headers
+
+
 def fetch_usage() -> dict:
     """
-    Read Claude Desktop session cookies and call claude.ai's internal API
-    to retrieve the usage percentages it displays.
+    Read Claude Desktop session cookies (or OAuth token) and call
+    claude.ai's internal API to retrieve the usage percentages it displays.
 
     Returns
     -------
@@ -559,24 +660,29 @@ def fetch_usage() -> dict:
         return empty
 
     cookies = get_claude_cookies()
-    if not cookies:
+    oauth   = get_oauth_token() if not cookies else None
+
+    if not cookies and not oauth:
         empty["error"] = (
             "No Claude Desktop session found. "
             "Make sure you are signed in to Claude Desktop."
         )
         return empty
 
-    headers = {
-        "Cookie": _cookie_header(cookies),
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        ),
-        "Accept": "application/json, text/plain, */*",
-        "Referer": "https://claude.ai/",
-        "Origin": "https://claude.ai",
-    }
+    if cookies:
+        headers = {
+            "Cookie": _cookie_header(cookies),
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+            "Accept": "application/json, text/plain, */*",
+            "Referer": "https://claude.ai/",
+            "Origin": "https://claude.ai",
+        }
+    else:
+        headers = _headers_for_oauth(oauth)  # type: ignore[arg-type]
 
     raw_responses: dict[str, object] = {}
 
@@ -866,6 +972,34 @@ def _diagnose_alt_auth(userdata_dirs: list[Path]) -> list[str]:
                 lines.append(f"  {k}: {v_str}")
         except Exception as exc:
             lines.append(f"  (error reading config.json: {exc})")
+
+    # ── E. Decrypt oauth:tokenCache and attempt API call ─────────────────────
+    lines.append("\n=== E. OAuth token decryption + API test ===")
+    token = get_oauth_token()
+    if token is None:
+        lines.append("  get_oauth_token() returned None")
+        lines.append("  (AES key failure, missing config.json, or no oauth:tokenCache key)")
+    else:
+        lines.append(f"  Decryption OK. Token keys: {list(token.keys())}")
+        # Show redacted previews
+        for k, v in token.items():
+            v_str = str(v)
+            if len(v_str) > 20:
+                v_str = v_str[:10] + "…" + v_str[-6:]
+            lines.append(f"    {k}: {v_str}")
+        # Attempt API call using the token
+        lines.append("\n  Attempting API call with OAuth token…")
+        result = fetch_usage()
+        if result["error"]:
+            lines.append(f"  Error: {result['error']}")
+        else:
+            lines.append(f"  pct_5h = {result['pct_5h']}")
+            lines.append(f"  pct_7d = {result['pct_7d']}")
+        if result.get("_raw"):
+            lines.append("  Raw responses:")
+            for url, data in result["_raw"].items():
+                lines.append(f"    {url}")
+                lines.append(f"      {str(data)[:300]}")
 
     return lines
 
